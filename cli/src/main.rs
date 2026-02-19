@@ -175,6 +175,12 @@ async fn main() -> Result<()> {
         Commands::Doc { contract_path, output } => {
             commands::doc(&contract_path, &output)?;
         }
+        Commands::Wizard {} => {
+            wizard::run(&cli.api_url).await?;
+        }
+        Commands::History { search, limit } => {
+            wizard::show_history(search.as_deref(), limit)?;
+        }
     }
     Ok(())
 }
