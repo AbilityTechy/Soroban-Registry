@@ -1,3 +1,4 @@
+use crate::config::Network;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde_json::json;
@@ -5,15 +6,12 @@ use serde_json::json;
 pub async fn search(
     api_url: &str,
     query: &str,
-    network: Option<&str>,
+    network: Network,
     verified_only: bool,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let mut url = format!("{}/api/contracts?query={}", api_url, query);
+    let mut url = format!("{}/api/contracts?query={}&network={}", api_url, query, network);
 
-    if let Some(net) = network {
-        url.push_str(&format!("&network={}", net));
-    }
     if verified_only {
         url.push_str("&verified_only=true");
     }
@@ -64,9 +62,9 @@ pub async fn search(
     Ok(())
 }
 
-pub async fn info(api_url: &str, contract_id: &str) -> Result<()> {
+pub async fn info(api_url: &str, contract_id: &str, network: Network) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("{}/api/contracts/{}", api_url, contract_id);
+    let url = format!("{}/api/contracts/{}?network={}", api_url, contract_id, network);
 
     let response = client
         .get(&url)
@@ -75,7 +73,7 @@ pub async fn info(api_url: &str, contract_id: &str) -> Result<()> {
         .context("Failed to fetch contract info")?;
 
     if !response.status().is_success() {
-        anyhow::bail!("Contract not found");
+        anyhow::bail!("Contract not found on {}", network);
     }
 
     let contract: serde_json::Value = response.json().await?;
@@ -126,7 +124,7 @@ pub async fn publish(
     contract_id: &str,
     name: &str,
     description: Option<&str>,
-    network: &str,
+    network: Network,
     category: Option<&str>,
     tags: Vec<String>,
     publisher: &str,
@@ -138,7 +136,7 @@ pub async fn publish(
         "contract_id": contract_id,
         "name": name,
         "description": description,
-        "network": network,
+        "network": network.to_string(),
         "category": category,
         "tags": tags,
         "publisher_address": publisher,
@@ -169,13 +167,9 @@ pub async fn publish(
     Ok(())
 }
 
-pub async fn list(api_url: &str, limit: usize, network: Option<&str>) -> Result<()> {
+pub async fn list(api_url: &str, limit: usize, network: Network) -> Result<()> {
     let client = reqwest::Client::new();
-    let mut url = format!("{}/api/contracts?page_size={}", api_url, limit);
-
-    if let Some(net) = network {
-        url.push_str(&format!("&network={}", net));
-    }
+    let url = format!("{}/api/contracts?page_size={}&network={}", api_url, limit, network);
 
     let response = client
         .get(&url)

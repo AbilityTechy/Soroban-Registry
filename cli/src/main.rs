@@ -1,7 +1,9 @@
 mod commands;
+mod config;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use config::Network;
 
 const CLI_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -21,6 +23,10 @@ struct Cli {
     /// API URL (defaults to http://localhost:3001)
     #[arg(long, env = "SOROBAN_REGISTRY_API_URL", default_value = "http://localhost:3001")]
     api_url: String,
+
+    /// Network (mainnet, testnet, futurenet)
+    #[arg(long, global = true)]
+    network: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -29,10 +35,6 @@ enum Commands {
     Search {
         /// Search query
         query: String,
-
-        /// Filter by network
-        #[arg(long)]
-        network: Option<String>,
 
         /// Show only verified contracts
         #[arg(long)]
@@ -59,10 +61,6 @@ enum Commands {
         #[arg(long)]
         description: Option<String>,
 
-        /// Network (mainnet, testnet, futurenet)
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
         /// Category
         #[arg(long)]
         category: Option<String>,
@@ -81,10 +79,6 @@ enum Commands {
         /// Number of contracts to show
         #[arg(long, default_value = "10")]
         limit: usize,
-
-        /// Filter by network
-        #[arg(long)]
-        network: Option<String>,
     },
 }
 
@@ -92,18 +86,20 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve network configuration
+    let network = config::resolve_network(cli.network)?;
+
     match cli.command {
-        Commands::Search { query, network, verified_only } => {
-            commands::search(&cli.api_url, &query, network.as_deref(), verified_only).await?;
+        Commands::Search { query, verified_only } => {
+            commands::search(&cli.api_url, &query, network, verified_only).await?;
         }
         Commands::Info { contract_id } => {
-            commands::info(&cli.api_url, &contract_id).await?;
+            commands::info(&cli.api_url, &contract_id, network).await?;
         }
         Commands::Publish {
             contract_id,
             name,
             description,
-            network,
             category,
             tags,
             publisher,
@@ -117,15 +113,15 @@ async fn main() -> Result<()> {
                 &contract_id,
                 &name,
                 description.as_deref(),
-                &network,
+                network,
                 category.as_deref(),
                 tags_vec,
                 &publisher,
             )
             .await?;
         }
-        Commands::List { limit, network } => {
-            commands::list(&cli.api_url, limit, network.as_deref()).await?;
+        Commands::List { limit } => {
+            commands::list(&cli.api_url, limit, network).await?;
         }
     }
 
