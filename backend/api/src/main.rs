@@ -47,6 +47,14 @@ async fn main() -> Result<()> {
     let state = AppState::new(pool);
     let rate_limit_state = RateLimitState::from_env();
 
+    let cors = CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("http://localhost:3000"),
+            HeaderValue::from_static("https://soroban-registry.vercel.app"),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
     // Build router
     let app = Router::new()
         .merge(routes::contract_routes())
@@ -57,6 +65,7 @@ async fn main() -> Result<()> {
             rate_limit::rate_limit_middleware,
         ))
         .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state);
 
     // Start server
