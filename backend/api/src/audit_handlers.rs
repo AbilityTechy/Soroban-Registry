@@ -9,6 +9,11 @@ use axum::{
 };
 use uuid::Uuid;
 
+use crate::models::{
+    AuditCheckRow, AuditRecord, AuditResponse, CategoryScore, CheckStatus, CheckWithStatus,
+    ContractSecuritySummary, CreateAuditRequest, DetectionMethod, ExportRequest,
+    UpdateCheckRequest,
+};
 use crate::{
     checklist::all_checks,
     detector::detect_all,

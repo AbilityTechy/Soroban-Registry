@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::patch::{PatchManager, Severity};
 use crate::profiler;
+use crate::sla::SlaManager;
 use crate::test_framework;
 
 pub async fn search(
@@ -144,6 +145,14 @@ pub async fn info(api_url: &str, contract_id: &str, network: Network) -> Result<
     Ok(())
 }
 
+fn resolve_smart_routing(current_network: Network) -> String {
+    if current_network.to_string() == "auto" {
+        "mainnet".to_string() 
+    } else {
+        current_network.to_string()
+    }
+}
+
 pub async fn publish(
     api_url: &str,
     contract_id: &str,
@@ -157,17 +166,23 @@ pub async fn publish(
     let client = reqwest::Client::new();
     let url = format!("{}/api/contracts", api_url);
 
+    let final_network = resolve_smart_routing(network);
+
     let payload = json!({
         "contract_id": contract_id,
         "name": name,
         "description": description,
-        "network": network.to_string(),
+        "network": final_network,
         "category": category,
         "tags": tags,
         "publisher_address": publisher,
+        "routing_mode": if network.to_string() == "auto" { "auto" } else { "manual" }
     });
 
     println!("\n{}", "Publishing contract...".bold().cyan());
+    if network.to_string() == "auto" {
+        println!("{} {}", "ℹ".blue(), format!("Auto-routing selected: {}", final_network).bright_black());
+    }
 
     let response = client
         .post(&url)
@@ -178,6 +193,11 @@ pub async fn publish(
 
     if !response.status().is_success() {
         let error_text = response.text().await?;
+        // FALLBACK LOGIC: If primary fails and we are in auto mode, try testnet
+        if network.to_string() == "auto" && final_network != "testnet" {
+            println!("{}", "⚠ Primary network unavailable. Attempting fallback...".yellow());
+            return Box::pin(publish(api_url, contract_id, name, description, Network::Testnet, category, tags, publisher)).await;
+        }
         anyhow::bail!("Failed to publish: {}", error_text);
     }
 
@@ -256,6 +276,7 @@ pub async fn list(api_url: &str, limit: usize, network: Network) -> Result<()> {
 
     Ok(())
 }
+
 
 pub async fn migrate(
     api_url: &str,
@@ -444,7 +465,7 @@ pub async fn export(
 }
 
 pub async fn import(
-    api_url: &str,
+    _api_url: &str,
     archive: &str,
     network: Network,
     output_dir: &str,
@@ -541,6 +562,76 @@ pub async fn patch_create(
             .red()
         );
     }
+
+    Ok(())
+}
+
+/// GET /api/contracts/:id/trust-score
+pub async fn trust_score(api_url: &str, contract_id: &str, network: Network) -> Result<()> {
+    let url = format!("{}/api/contracts/{}/trust-score", api_url, contract_id);
+    log::debug!("GET {}", url);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .query(&[("network", network.to_string())])
+        .send()
+        .await
+        .context("Failed to reach registry API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to get trust score ({}): {}", status, body);
+    }
+
+    let data: serde_json::Value = resp.json().await.context("Failed to parse trust score response")?;
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    let name       = data["contract_name"].as_str().unwrap_or("Unknown");
+    let score      = data["score"].as_f64().unwrap_or(0.0);
+    let badge      = data["badge"].as_str().unwrap_or("Bronze");
+    let badge_icon = data["badge_icon"].as_str().unwrap_or("🥉");
+    let summary    = data["summary"].as_str().unwrap_or("");
+
+    println!("\n{}", "─".repeat(56));
+    println!("  Trust Score — {}", name.bold());
+    println!("{}", "─".repeat(56));
+    println!("  Score : {:.0}/100", score);
+    println!("  Badge : {} {}", badge_icon, badge.bold());
+    println!("  {}",  summary);
+    println!("{}", "─".repeat(56));
+
+    // ── Factor breakdown ──────────────────────────────────────────────────────
+    println!("\n  {} Factor Breakdown\n", "📊".bold());
+
+    if let Some(factors) = data["factors"].as_array() {
+        for factor in factors {
+            let fname   = factor["name"].as_str().unwrap_or("");
+            let earned  = factor["points_earned"].as_f64().unwrap_or(0.0);
+            let max     = factor["points_max"].as_f64().unwrap_or(0.0);
+            let explain = factor["explanation"].as_str().unwrap_or("");
+
+            // Mini progress bar (10 chars)
+            let filled = ((earned / max) * 10.0).round() as usize;
+            let filled = filled.min(10);
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+
+            println!("  {:<28} [{bar}] {:.0}/{:.0}", fname, earned, max);
+            println!("    {}", explain.dimmed());
+        }
+    }
+
+    // ── Weight documentation ──────────────────────────────────────────────────
+    println!("\n  {} Score Weights\n", "⚖️".bold());
+    if let Some(weights) = data["weights"].as_object() {
+        for (k, v) in weights {
+            println!("  {:<22} {:.0} pts max", k, v.as_f64().unwrap_or(0.0));
+        }
+    }
+
+    let computed_at = data["computed_at"].as_str().unwrap_or("");
+    println!("\n  Computed at: {}\n", computed_at.dimmed());
 
     Ok(())
 }
@@ -708,11 +799,70 @@ pub async fn profile(
         }
     }
 
+pub async fn deps_list(api_url: &str, contract_id: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/contracts/{}/dependencies", api_url, contract_id);
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to fetch contract dependencies")?;
+
+    if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+             anyhow::bail!("Contract not found");
+        }
+        anyhow::bail!("Failed to fetch dependencies: {}", response.status());
+    }
+
+    let items: serde_json::Value = response.json().await?;
+    let tree = items.as_array().context("Invalid response format")?;
+
+    println!("\n{}", "Dependency Tree:".bold().cyan());
+    println!("{}", "=".repeat(80).cyan());
+
+    if tree.is_empty() {
+        println!("{}", "No dependencies found.".yellow());
+        return Ok(());
+    }
+
+    fn print_tree(nodes: &[serde_json::Value], prefix: &str, is_last: bool) {
+        for (i, node) in nodes.iter().enumerate() {
+            let name = node["name"].as_str().unwrap_or("Unknown");
+            let constraint = node["constraint_to_parent"].as_str().unwrap_or("*");
+            let contract_id = node["contract_id"].as_str().unwrap_or("");
+            
+            let is_node_last = i == nodes.len() - 1;
+            let marker = if is_node_last { "└──" } else { "├──" };
+            
+            println!(
+                "{}{} {} ({}) {}", 
+                prefix, 
+                marker.bright_black(), 
+                name.bold(), 
+                constraint.cyan(),
+                if contract_id == "unknown" { "[Unresolved]".red() } else { "".normal() }
+            );
+
+            if let Some(children) = node["dependencies"].as_array() {
+                if !children.is_empty() {
+                     let new_prefix = format!("{}{}", prefix, if is_node_last { "    " } else { "│   " });
+                     print_tree(children, &new_prefix, true);
+                }
+            }
+        }
+    }
+
+    print_tree(tree, "", true);
+
+
     println!("\n{}", "=".repeat(80).cyan());
     println!();
 
     Ok(())
 }
+
 
 pub async fn run_tests(
     test_file: &str,
@@ -805,7 +955,7 @@ pub async fn run_tests(
     }
 
     if let Some(junit_path) = junit_output {
-        test_framework::generate_junit_xml(&[result], Path::new(junit_path))?;
+        test_framework::generate_junit_xml(&[result.clone()], Path::new(junit_path))?;
         println!("\n{} JUnit XML report exported to: {}", "✓".green(), junit_path);
     }
 
@@ -825,3 +975,4 @@ pub async fn run_tests(
 
     Ok(())
 }
+

@@ -1,5 +1,7 @@
 ﻿pub mod migrations;
 
+use crate::trust::{compute_trust_score, TrustInput};
+
 use axum::{
     extract::{
         rejection::{JsonRejection, QueryRejection},
@@ -10,18 +12,10 @@ use axum::{
     Json,
 };
 use shared::{
-    AbTest, AbTestAssignment, AbTestMetric, AbTestResult, AbTestStatus, AbTestVariant,
-    AdvanceCanaryRequest, AlertSeverity, CanaryMetric, CanaryRelease, CanaryStatus,
-    CanaryUserAssignment, Contract, ContractDeployment, ContractSearchParams, ContractVersion,
-    CreateAbTestRequest, CreateAlertConfigRequest, CreateCanaryRequest, DeployGreenRequest,
-    DeploymentEnvironment, DeploymentStatus, DeploymentSwitch, GetVariantRequest,
-    HealthCheckRequest, MetricType, PaginatedResponse, PerformanceAlert, PerformanceAlertConfig,
-    PerformanceAnomaly, PerformanceMetric, PerformanceTrend, PublishRequest, Publisher,
-    RecordAbTestMetricRequest, RecordCanaryMetricRequest, RecordPerformanceMetricRequest,
-    RolloutStage, SwitchDeploymentRequest, VariantType, VerifyRequest,
+    Contract, ContractDeployment, ContractSearchParams, ContractVersion, DeployGreenRequest,
+    DeploymentEnvironment, DeploymentStatus, DeploymentSwitch, HealthCheckRequest,
+    PaginatedResponse, PublishRequest, Publisher, SwitchDeploymentRequest, VerifyRequest,
 };
-use rust_decimal::Decimal;
-use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{
@@ -102,9 +96,9 @@ pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<serde_js
 
     let verified_contracts: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE is_verified = true")
-        .fetch_one(&state.db)
-        .await
-        .map_err(|err| db_internal_error("count verified contracts", err))?;
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| db_internal_error("count verified contracts", err))?;
 
     let total_publishers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publishers")
         .fetch_one(&state.db)
@@ -441,8 +435,8 @@ pub async fn get_publisher_contracts(
     let contracts: Vec<Contract> =
         sqlx::query_as("SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC")
             .bind(id)
-    .fetch_all(&state.db)
-    .await
+            .fetch_all(&state.db)
+            .await
             .map_err(|err| db_internal_error("list publisher contracts", err))?;
 
     Ok(Json(contracts))
@@ -983,6 +977,2599 @@ pub async fn get_cache_stats(
     })))
 }
 
+/// GET /api/contracts/:id/trust-score
+///
+/// Returns a 0–100 trust score with a per-factor breakdown explaining
+/// exactly why a contract received its score. Scores are computed on demand
+/// from live DB data (verification status, latest audit, usage stats, age,
+/// and unresolved critical vulnerabilities).
+pub async fn get_trust_score(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // ── 1. Load the contract ──────────────────────────────────────────────────
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract for trust score", err),
+        })?;
+
+    // ── 2. Latest audit score (optional) ─────────────────────────────────────
+    let latest_audit_score: Option<f64> = sqlx::query_scalar(
+        "SELECT overall_score FROM security_audits
+         WHERE contract_id = $1
+         ORDER BY audit_date DESC
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get latest audit score", err))?;
+
+    // ── 3. Unresolved critical vulnerabilities ────────────────────────────────
+    // A critical vuln is an audit check with severity=critical AND status=failed
+    // that belongs to the most recent audit for this contract.
+    let unresolved_critical_vulns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM audit_checks ac
+         JOIN security_audits sa ON sa.id = ac.audit_id
+         WHERE sa.contract_id = $1
+           AND ac.status = 'failed'
+           AND sa.id = (
+               SELECT id FROM security_audits
+               WHERE contract_id = $1
+               ORDER BY audit_date DESC
+               LIMIT 1
+           )",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("count critical vulns", err))?;
+
+    // ── 4. Usage stats ────────────────────────────────────────────────────────
+    let total_deployments: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events
+         WHERE contract_id = $1 AND event_type = 'contract_deployed'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("count deployments for trust", err))?;
+
+    let total_interactions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events WHERE contract_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("count interactions for trust", err))?;
+
+    // ── 5. Compute score ──────────────────────────────────────────────────────
+    let input = crate::trust::TrustInput {
+        is_verified:               contract.is_verified,
+        latest_audit_score,
+        total_deployments,
+        total_interactions,
+        created_at:                contract.created_at,
+        unresolved_critical_vulns,
+    };
+
+    let trust = crate::trust::compute_trust_score(&input);
+
+    // ── 6. Return JSON ────────────────────────────────────────────────────────
+    Ok(Json(serde_json::json!({
+        "contract_id":   id,
+        "contract_name": contract.name,
+        "score":         trust.score,
+        "badge":         trust.badge,
+        "badge_icon":    trust.badge_icon,
+        "summary":       trust.summary,
+        "factors":       trust.factors,
+        "weights": {
+            "verification":  crate::trust::WEIGHT_VERIFIED,
+            "audit_quality": crate::trust::WEIGHT_AUDIT,
+            "usage":         crate::trust::WEIGHT_USAGE,
+            "age":           crate::trust::WEIGHT_AGE,
+            "no_vulns":      crate::trust::WEIGHT_NO_VULNS,
+        },
+        "computed_at": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Json,
+};
+use serde::Deserialize;
+use shared::{
+    Contract, ContractSearchParams, ContractVersion, GraphEdge, GraphNode, GraphResponse, Network,
+    PaginatedResponse, PublishRequest, Publisher, VerifyRequest,
+};
+use uuid::Uuid;
+
+use crate::state::AppState;
+
+/// Health check endpoint
+pub async fn health_check() -> &'static str {
+    "OK"
+}
+
+/// Get registry statistics
+pub async fn get_stats(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let total_contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let verified_contracts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE is_verified = true")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let total_publishers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publishers")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "total_contracts": total_contracts,
+        "verified_contracts": verified_contracts,
+        "total_publishers": total_publishers,
+    })))
+}
+
+/// Get dependency graph data for all contracts
+#[derive(Debug, Deserialize)]
+pub struct GraphParams {
+    pub network: Option<Network>,
+}
+
+pub async fn get_contract_graph(
+    State(state): State<AppState>,
+    Query(params): Query<GraphParams>,
+) -> Result<Json<GraphResponse>, StatusCode> {
+    // Query nodes
+    let nodes: Vec<GraphNode> = if let Some(ref network) = params.network {
+        sqlx::query_as::<_, (uuid::Uuid, String, String, Network, bool, Option<String>, Vec<String>)>(
+            "SELECT id, contract_id, name, network, is_verified, category, tags FROM contracts WHERE network = $1"
+        )
+        .bind(network)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(|(id, contract_id, name, network, is_verified, category, tags)| GraphNode {
+            id, contract_id, name, network, is_verified, category, tags,
+        })
+        .collect()
+    } else {
+        sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Network,
+                bool,
+                Option<String>,
+                Vec<String>,
+            ),
+        >(
+            "SELECT id, contract_id, name, network, is_verified, category, tags FROM contracts"
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(
+            |(id, contract_id, name, network, is_verified, category, tags)| GraphNode {
+                id,
+                contract_id,
+                name,
+                network,
+                is_verified,
+                category,
+                tags,
+            },
+        )
+        .collect()
+    };
+
+    // Collect node IDs for filtering edges
+    let node_ids: std::collections::HashSet<uuid::Uuid> = nodes.iter().map(|n| n.id).collect();
+
+    // Query all edges
+    let all_edges: Vec<(uuid::Uuid, uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT contract_id, depends_on_id, dependency_type FROM contract_dependencies",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Filter edges to only include nodes in our set
+    let edges: Vec<GraphEdge> = all_edges
+        .into_iter()
+        .filter(|(source, target, _)| node_ids.contains(source) && node_ids.contains(target))
+        .map(|(source, target, dependency_type)| GraphEdge {
+            source,
+            target,
+            dependency_type,
+        })
+        .collect();
+
+    Ok(Json(GraphResponse { nodes, edges }))
+}
+
+/// List and search contracts
+pub async fn list_contracts(
+    State(state): State<AppState>,
+    Query(params): Query<ContractSearchParams>,
+) -> Result<Json<PaginatedResponse<Contract>>, StatusCode> {
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+    let offset = (page - 1) * page_size;
+
+    // Build dynamic query based on filters
+    let mut query = String::from("SELECT * FROM contracts WHERE 1=1");
+    let mut count_query = String::from("SELECT COUNT(*) FROM contracts WHERE 1=1");
+
+    if let Some(ref q) = params.query {
+        let search_clause = format!(" AND (name ILIKE '%{}%' OR description ILIKE '%{}%')", q, q);
+        query.push_str(&search_clause);
+        count_query.push_str(&search_clause);
+    }
+
+    if let Some(verified) = params.verified_only {
+        if verified {
+            query.push_str(" AND is_verified = true");
+            count_query.push_str(" AND is_verified = true");
+        }
+    }
+
+    if let Some(ref category) = params.category {
+        let category_clause = format!(" AND category = '{}'", category);
+        query.push_str(&category_clause);
+        count_query.push_str(&category_clause);
+    }
+
+    query.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT {} OFFSET {}",
+        page_size, offset
+    ));
+
+    let contracts: Vec<Contract> = sqlx::query_as(&query)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let total: i64 = sqlx::query_scalar(&count_query)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(PaginatedResponse::new(
+        contracts, total, page, page_size,
+    )))
+}
+
+/// Get a specific contract by ID
+pub async fn get_contract(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Contract>, StatusCode> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(Json(contract))
+}
+
+/// Get contract version history
+pub async fn get_contract_versions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ContractVersion>>, StatusCode> {
+    let versions: Vec<ContractVersion> = sqlx::query_as(
+        "SELECT * FROM contract_versions WHERE contract_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(versions))
+}
+
+/// Publish a new contract
+pub async fn publish_contract(
+    State(state): State<AppState>,
+    Json(req): Json<PublishRequest>,
+) -> Result<Json<Contract>, StatusCode> {
+    // First, ensure publisher exists or create one
+    let publisher: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address) VALUES ($1)
+         ON CONFLICT (stellar_address) DO UPDATE SET stellar_address = EXCLUDED.stellar_address
+         RETURNING *",
+    )
+    .bind(&req.publisher_address)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // TODO: Fetch WASM hash from Stellar network
+    let wasm_hash = "placeholder_hash".to_string();
+
+    // Insert contract
+    let contract: Contract = sqlx::query_as(
+        "INSERT INTO contracts (contract_id, wasm_hash, name, description, publisher_id, network, category, tags)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *"
+    )
+        .bind(&req.contract_id)
+        .bind(&wasm_hash)
+        .bind(&req.name)
+        .bind(&req.description)
+        .bind(publisher.id)
+        .bind(&req.network)
+        .bind(&req.category)
+        .bind(&req.tags)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(contract))
+}
+
+/// Verify a contract
+pub async fn verify_contract(
+    State(_state): State<AppState>,
+    Json(_req): Json<VerifyRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Implement verification logic
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "message": "Verification started"
+    })))
+}
+
+/// Create a publisher
+pub async fn create_publisher(
+    State(state): State<AppState>,
+    Json(publisher): Json<Publisher>,
+) -> Result<Json<Publisher>, StatusCode> {
+    let created: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address, username, email, github_url, website)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *",
+    )
+    .bind(&publisher.stellar_address)
+    .bind(&publisher.username)
+    .bind(&publisher.email)
+    .bind(&publisher.github_url)
+    .bind(&publisher.website)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(created))
+}
+
+/// Get publisher by ID
+pub async fn get_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Publisher>, StatusCode> {
+    let publisher: Publisher = sqlx::query_as("SELECT * FROM publishers WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(Json(publisher))
+}
+
+/// Get all contracts by a publisher
+pub async fn get_publisher_contracts(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<Contract>>, StatusCode> {
+    let contracts: Vec<Contract> =
+        sqlx::query_as("SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC")
+            .bind(id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(contracts))
+}
+﻿pub mod migrations;
+
+use axum::{
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        Path, Query, State,
+    },
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use shared::{
+    Contract, ContractDeployment, ContractSearchParams, ContractVersion, DeployGreenRequest,
+    DeploymentEnvironment, DeploymentStatus, DeploymentSwitch, HealthCheckRequest,
+    PaginatedResponse, PublishRequest, Publisher, SwitchDeploymentRequest, VerifyRequest,
+};
+use uuid::Uuid;
+
+use crate::{
+    analytics,
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+
+pub fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
+    tracing::error!(operation = operation, error = ?err, "database operation failed");
+    ApiError::internal("An unexpected database error occurred")
+}
+
+fn map_json_rejection(err: JsonRejection) -> ApiError {
+    ApiError::bad_request(
+        "InvalidRequest",
+        format!("Invalid JSON payload: {}", err.body_text()),
+    )
+}
+
+fn map_query_rejection(err: QueryRejection) -> ApiError {
+    ApiError::bad_request(
+        "InvalidQuery",
+        format!("Invalid query parameters: {}", err.body_text()),
+    )
+}
+
+/// Health check ΓÇö probes DB connectivity and reports uptime.
+/// Returns 200 when everything is reachable, 503 when the database
+/// connection pool cannot satisfy a trivial query.
+pub async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let uptime = state.started_at.elapsed().as_secs();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Quick connectivity probe ΓÇö keeps the query as cheap as possible
+    // so that frequent polling from orchestrators doesn't add load.
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    if db_ok {
+        tracing::info!(uptime_secs = uptime, "health check passed");
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    } else {
+        tracing::warn!(
+            uptime_secs = uptime,
+            "health check degraded ΓÇö db unreachable"
+        );
+
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "degraded",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    }
+}
+
+/// Get registry statistics
+pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let total_contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count contracts", err))?;
+
+    let verified_contracts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE is_verified = true")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| db_internal_error("count verified contracts", err))?;
+
+    let total_publishers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publishers")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count publishers", err))?;
+
+    Ok(Json(serde_json::json!({
+        "total_contracts": total_contracts,
+        "verified_contracts": verified_contracts,
+        "total_publishers": total_publishers,
+    })))
+}
+
+/// List and search contracts
+pub async fn list_contracts(
+    State(state): State<AppState>,
+    params: Result<Query<ContractSearchParams>, QueryRejection>,
+) -> axum::response::Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(err) => return map_query_rejection(err).into_response(),
+    };
+
+    let page = params.page.unwrap_or(1);
+    let limit = params.limit.unwrap_or(20);
+
+    // bad input, bail early
+    if page < 1 || limit < 1 || limit > 100 {
+        return ApiError::bad_request(
+            "InvalidPagination",
+            "page must be >= 1 and limit must be between 1 and 100",
+        )
+        .into_response();
+    }
+
+    let offset = (page - 1) * limit;
+
+    // Build dynamic query based on filters
+    let mut query = String::from("SELECT * FROM contracts WHERE 1=1");
+    let mut count_query = String::from("SELECT COUNT(*) FROM contracts WHERE 1=1");
+
+    if let Some(ref q) = params.query {
+        let search_clause = format!(" AND (name ILIKE '%{}%' OR description ILIKE '%{}%')", q, q);
+        query.push_str(&search_clause);
+        count_query.push_str(&search_clause);
+    }
+
+    if let Some(verified) = params.verified_only {
+        if verified {
+            query.push_str(" AND is_verified = true");
+            count_query.push_str(" AND is_verified = true");
+        }
+    }
+
+    if let Some(ref category) = params.category {
+        let category_clause = format!(" AND category = '{}'", category);
+        query.push_str(&category_clause);
+        count_query.push_str(&category_clause);
+    }
+
+    query.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT {} OFFSET {}",
+        limit, offset
+    ));
+
+    let contracts: Vec<Contract> = match sqlx::query_as(&query).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(err) => return db_internal_error("list contracts", err).into_response(),
+    };
+
+    let total: i64 = match sqlx::query_scalar(&count_query).fetch_one(&state.db).await {
+        Ok(n) => n,
+        Err(err) => return db_internal_error("count filtered contracts", err).into_response(),
+    };
+
+    let paginated = PaginatedResponse::new(contracts, total, page, limit);
+
+    // link headers for pagination
+    let total_pages = paginated.total_pages;
+    let mut links: Vec<String> = Vec::new();
+
+    if page > 1 {
+        links.push(format!(
+            "</api/contracts?page={}&limit={}>; rel=\"prev\"",
+            page - 1,
+            limit
+        ));
+    }
+    if page < total_pages {
+        links.push(format!(
+            "</api/contracts?page={}&limit={}>; rel=\"next\"",
+            page + 1,
+            limit
+        ));
+    }
+
+    let mut response = (StatusCode::OK, Json(paginated)).into_response();
+
+    if !links.is_empty() {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&links.join(", ")) {
+            response.headers_mut().insert("link", value);
+        }
+    }
+
+    response
+}
+
+pub async fn get_contract(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Contract>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract by id", err),
+        })?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    if let Some(deployment) = active_deployment {
+        let mut contract_with_deployment = contract.clone();
+        contract_with_deployment.wasm_hash = deployment.wasm_hash;
+        Ok(Json(contract_with_deployment))
+    } else {
+    Ok(Json(contract))
+    }
+}
+
+/// Get contract ABI
+pub async fn get_contract_abi(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let abi: Option<serde_json::Value> = sqlx::query_scalar("SELECT abi FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    abi.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Get contract version history
+pub async fn get_contract_versions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<ContractVersion>>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    let versions: Vec<ContractVersion> = sqlx::query_as(
+        "SELECT * FROM contract_versions WHERE contract_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("list versions", err))?;
+
+    Ok(Json(versions))
+}
+
+/// Publish a new contract
+pub async fn publish_contract(
+    State(state): State<AppState>,
+    payload: Result<Json<PublishRequest>, JsonRejection>,
+) -> ApiResult<Json<Contract>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    // First, ensure publisher exists or create one
+    let publisher: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address) VALUES ($1)
+         ON CONFLICT (stellar_address) DO UPDATE SET stellar_address = EXCLUDED.stellar_address
+         RETURNING *",
+    )
+    .bind(&req.publisher_address)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("upsert publisher", err))?;
+
+    // TODO: Fetch WASM hash from Stellar network
+    let wasm_hash = "placeholder_hash".to_string();
+
+    let contract: Contract = sqlx::query_as(
+        "INSERT INTO contracts (contract_id, wasm_hash, name, description, publisher_id, network, category, tags)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *",
+    )
+    .bind(&req.contract_id)
+    .bind(&wasm_hash)
+    .bind(&req.name)
+    .bind(&req.description)
+    .bind(publisher.id)
+    .bind(&req.network)
+    .bind(&req.category)
+    .bind(&req.tags)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create contract", err))?;
+
+    // Fire-and-forget analytics event
+    let pool = state.db.clone();
+    let cid = contract.id;
+    let addr = req.publisher_address.clone();
+    let net = contract.network.clone();
+    tokio::spawn(async move {
+        if let Err(err) = analytics::record_event(
+            &pool,
+            AnalyticsEventType::ContractPublished,
+            cid,
+            Some(&addr),
+            Some(&net),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(error = ?err, "failed to record contract_published event");
+        }
+    });
+    sqlx::query(
+        "INSERT INTO contract_deployments (contract_id, environment, status, wasm_hash, activated_at)
+         VALUES ($1, 'blue', 'active', $2, NOW())
+         ON CONFLICT (contract_id, environment) DO NOTHING",
+    )
+    .bind(contract.id)
+    .bind(&wasm_hash)
+    .execute(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create initial blue deployment", err))?;
+
+    Ok(Json(contract))
+}
+
+/// Verify a contract
+pub async fn verify_contract(
+    State(state): State<AppState>,
+    payload: Result<Json<VerifyRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    // TODO: Implement full verification logic
+
+    // Fire-and-forget analytics event
+    // We parse the contract_id string as UUID for the event; if it fails we skip.
+    if let Ok(cid) = Uuid::parse_str(&req.contract_id) {
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(err) = analytics::record_event(
+                &pool,
+                AnalyticsEventType::ContractVerified,
+                cid,
+                None,
+                None,
+                Some(serde_json::json!({ "compiler_version": req.compiler_version })),
+            )
+            .await
+            {
+                tracing::warn!(error = ?err, "failed to record contract_verified event");
+            }
+        });
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "message": "Verification started"
+    })))
+}
+
+/// Create a publisher
+pub async fn create_publisher(
+    State(state): State<AppState>,
+    payload: Result<Json<Publisher>, JsonRejection>,
+) -> ApiResult<Json<Publisher>> {
+    let Json(publisher) = payload.map_err(map_json_rejection)?;
+
+    let created: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address, username, email, github_url, website)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *",
+    )
+    .bind(&publisher.stellar_address)
+    .bind(&publisher.username)
+    .bind(&publisher.email)
+    .bind(&publisher.github_url)
+    .bind(&publisher.website)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create publisher", err))?;
+
+    Ok(Json(created))
+}
+
+/// Get publisher by ID
+pub async fn get_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Publisher>> {
+    let publisher: Publisher = sqlx::query_as("SELECT * FROM publishers WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "PublisherNotFound",
+                format!("No publisher found with ID: {}", id),
+            ),
+            _ => db_internal_error("get publisher by id", err),
+        })?;
+
+    Ok(Json(publisher))
+}
+
+/// Get all contracts by a publisher
+pub async fn get_publisher_contracts(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Vec<Contract>>> {
+    let contracts: Vec<Contract> =
+        sqlx::query_as("SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC")
+            .bind(id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_internal_error("list publisher contracts", err))?;
+
+    Ok(Json(contracts))
+}
+
+/// Get analytics for a specific contract
+pub async fn get_contract_analytics(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ContractAnalyticsResponse>> {
+    // Verify the contract exists
+    let _contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract for analytics", err),
+        })?;
+
+    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
+
+    // Deployment stats
+    let deploy_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("deployment count", e))?;
+
+    let unique_deployers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed' AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique deployers", e))?;
+
+    let by_network: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT COALESCE(jsonb_object_agg(COALESCE(network::text, 'unknown'), cnt), '{}'::jsonb)
+        FROM (SELECT network, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed' GROUP BY network) sub"#,
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("network breakdown", e))?;
+
+    let unique_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events WHERE contract_id = $1 AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique interactors", e))?;
+
+    let top_user_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_address, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $1 AND user_address IS NOT NULL GROUP BY user_address ORDER BY cnt DESC LIMIT 10",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("top users", e))?;
+
+    let top_users: Vec<TopUser> = top_user_rows
+        .into_iter()
+        .map(|(address, count)| TopUser { address, count })
+        .collect();
+
+    let timeline_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"SELECT d::date AS date, COALESCE(e.cnt, 0) AS count
+        FROM generate_series(($1::timestamptz)::date, CURRENT_DATE, '1 day'::interval) d
+        LEFT JOIN (SELECT DATE(created_at) AS event_date, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $2 AND created_at >= $1 GROUP BY DATE(created_at)) e ON d::date = e.event_date
+        ORDER BY d::date"#,
+    )
+    .bind(thirty_days_ago)
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("timeline", e))?;
+
+    let timeline: Vec<TimelineEntry> = timeline_rows
+        .into_iter()
+        .map(|(date, count)| TimelineEntry { date, count })
+        .collect();
+
+    Ok(Json(ContractAnalyticsResponse {
+        contract_id: id,
+        deployments: DeploymentStats { count: deploy_count, unique_users: unique_deployers, by_network },
+        interactors: InteractorStats { unique_count, top_users },
+        timeline,
+    }))
+}
+pub async fn deploy_green(
+    State(state): State<AppState>,
+    payload: Result<Json<DeployGreenRequest>, JsonRejection>,
+) -> ApiResult<Json<ContractDeployment>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract for analytics", err),
+        })?;
+
+    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
+
+    // ΓöÇΓöÇ Deployment stats ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    let deploy_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events \
+         WHERE contract_id = $1 AND event_type = 'contract_deployed'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("deployment count", e))?;
+
+    let unique_deployers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events \
+         WHERE contract_id = $1 AND event_type = 'contract_deployed' AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique deployers", e))?;
+
+    let by_network: serde_json::Value = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(
+            jsonb_object_agg(COALESCE(network::text, 'unknown'), cnt),
+            '{}'::jsonb
+        )
+        FROM (
+            SELECT network, COUNT(*) AS cnt
+            FROM analytics_events
+            WHERE contract_id = $1 AND event_type = 'contract_deployed'
+            GROUP BY network
+        ) sub
+        "#,
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("network breakdown", e))?;
+
+    // ΓöÇΓöÇ Interactor stats ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    let unique_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events \
+         WHERE contract_id = $1 AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique interactors", e))?;
+
+    let top_user_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_address, COUNT(*) AS cnt FROM analytics_events \
+         WHERE contract_id = $1 AND user_address IS NOT NULL \
+         GROUP BY user_address ORDER BY cnt DESC LIMIT 10",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("top users", e))?;
+
+    let top_users: Vec<TopUser> = top_user_rows
+        .into_iter()
+        .map(|(address, count)| TopUser { address, count })
+        .collect();
+
+    // ΓöÇΓöÇ Timeline (last 30 days) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    let timeline_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"
+        SELECT d::date AS date, COALESCE(e.cnt, 0) AS count
+        FROM generate_series(
+            ($1::timestamptz)::date,
+            CURRENT_DATE,
+            '1 day'::interval
+        ) d
+        LEFT JOIN (
+            SELECT DATE(created_at) AS event_date, COUNT(*) AS cnt
+            FROM analytics_events
+            WHERE contract_id = $2
+              AND created_at >= $1
+            GROUP BY DATE(created_at)
+        ) e ON d::date = e.event_date
+        ORDER BY d::date
+        "#,
+    )
+    .bind(thirty_days_ago)
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("timeline", e))?;
+
+    let timeline: Vec<TimelineEntry> = timeline_rows
+        .into_iter()
+        .map(|(date, count)| TimelineEntry { date, count })
+        .collect();
+
+    // ΓöÇΓöÇ Build response ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    Ok(Json(ContractAnalyticsResponse {
+        contract_id: id,
+        deployments: DeploymentStats {
+            count: deploy_count,
+            unique_users: unique_deployers,
+            by_network,
+        },
+        interactors: InteractorStats {
+            unique_count,
+            top_users,
+        },
+        timeline,
+    }))
+}
+
+
+pub async fn switch_deployment(
+    State(state): State<AppState>,
+    payload: Result<Json<SwitchDeploymentRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+    let force = req.force.unwrap_or(false);
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", req.contract_id),
+            ),
+            _ => db_internal_error("get contract for switch", err),
+        })?;
+
+    let mut tx = state.db.begin().await.map_err(|err| {
+        db_internal_error("begin transaction for switch", err)
+    })?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    let from_env = active_deployment
+        .as_ref()
+        .map(|d| d.environment.clone())
+        .unwrap_or(DeploymentEnvironment::Blue);
+
+    let to_env = match from_env {
+        DeploymentEnvironment::Blue => DeploymentEnvironment::Green,
+        DeploymentEnvironment::Green => DeploymentEnvironment::Blue,
+    };
+
+    let green_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND environment = 'green'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get green deployment", err))?;
+
+    if let Some(ref green) = green_deployment {
+        if !force && green.status != DeploymentStatus::Testing {
+            return Err(ApiError::bad_request(
+                "InvalidDeploymentStatus",
+                "Green deployment must be in testing status before switch",
+            ));
+        }
+        if !force && green.health_checks_passed < 3 {
+            return Err(ApiError::bad_request(
+                "InsufficientHealthChecks",
+                "Green deployment must pass at least 3 health checks before switch",
+            ));
+        }
+    } else {
+        return Err(ApiError::bad_request(
+            "NoGreenDeployment",
+            "No green deployment found",
+        ));
+    }
+
+    if let Some(ref active) = active_deployment {
+        sqlx::query("UPDATE contract_deployments SET status = 'inactive' WHERE id = $1")
+            .bind(active.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("deactivate current deployment", err))?;
+    }
+
+    sqlx::query(
+        "UPDATE contract_deployments 
+         SET status = 'active', activated_at = NOW() 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("activate new deployment", err))?;
+
+    sqlx::query_as::<_, DeploymentSwitch>(
+        "INSERT INTO deployment_switches (contract_id, from_environment, to_environment)
+         VALUES ($1, $2, $3)
+         RETURNING *",
+    )
+    .bind(contract.id)
+    .bind(&from_env)
+    .bind(&to_env)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("record deployment switch", err))?;
+
+    tx.commit().await.map_err(|err| {
+        db_internal_error("commit deployment switch", err)
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "switched_from": from_env,
+        "switched_to": to_env,
+        "contract_id": req.contract_id
+    })))
+}
+
+pub async fn rollback_deployment(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", contract_id),
+            ),
+            _ => db_internal_error("get contract for rollback", err),
+        })?;
+
+    let mut tx = state.db.begin().await.map_err(|err| {
+        db_internal_error("begin transaction for rollback", err)
+    })?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    let from_env = active_deployment
+        .as_ref()
+        .map(|d| d.environment.clone())
+        .unwrap_or(DeploymentEnvironment::Green);
+
+    let to_env = match from_env {
+        DeploymentEnvironment::Blue => DeploymentEnvironment::Green,
+        DeploymentEnvironment::Green => DeploymentEnvironment::Blue,
+    };
+
+    let target_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get target deployment", err))?;
+
+    if target_deployment.is_none() {
+        return Err(ApiError::bad_request(
+            "NoDeploymentToRollback",
+            format!("No {} deployment found to rollback to", to_env),
+        ));
+    }
+
+    if let Some(ref active) = active_deployment {
+        sqlx::query("UPDATE contract_deployments SET status = 'inactive' WHERE id = $1")
+            .bind(active.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("deactivate current deployment", err))?;
+    }
+
+    sqlx::query(
+        "UPDATE contract_deployments 
+         SET status = 'active', activated_at = NOW() 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("activate rollback deployment", err))?;
+
+    sqlx::query_as::<_, DeploymentSwitch>(
+        "INSERT INTO deployment_switches (contract_id, from_environment, to_environment, rollback)
+         VALUES ($1, $2, $3, true)
+         RETURNING *",
+    )
+    .bind(contract.id)
+    .bind(&from_env)
+    .bind(&to_env)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("record rollback switch", err))?;
+
+    tx.commit().await.map_err(|err| {
+        db_internal_error("commit rollback", err)
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rolled_back_from": from_env,
+        "rolled_back_to": to_env,
+        "contract_id": contract_id
+    })))
+}
+
+pub async fn report_health_check(
+    State(state): State<AppState>,
+    payload: Result<Json<HealthCheckRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", req.contract_id),
+            ),
+            _ => db_internal_error("get contract for health check", err),
+        })?;
+
+    let env_str = match req.environment {
+        DeploymentEnvironment::Blue => "blue",
+        DeploymentEnvironment::Green => "green",
+    };
+
+    if req.passed {
+        sqlx::query(
+            "UPDATE contract_deployments 
+             SET health_checks_passed = health_checks_passed + 1, 
+                 last_health_check_at = NOW()
+             WHERE contract_id = $1 AND environment = $2",
+        )
+        .bind(contract.id)
+        .bind(&req.environment)
+        .execute(&state.db)
+        .await
+        .map_err(|err| db_internal_error("update health check passed", err))?;
+    } else {
+        sqlx::query(
+            "UPDATE contract_deployments 
+             SET health_checks_failed = health_checks_failed + 1, 
+                 status = CASE WHEN health_checks_failed + 1 >= 3 THEN 'failed' ELSE status END,
+                 last_health_check_at = NOW()
+             WHERE contract_id = $1 AND environment = $2",
+        )
+        .bind(contract.id)
+        .bind(&req.environment)
+        .execute(&state.db)
+        .await
+        .map_err(|err| db_internal_error("update health check failed", err))?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "environment": env_str,
+        "passed": req.passed
+    })))
+}
+
+pub async fn get_deployment_status(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", contract_id),
+            ),
+            _ => db_internal_error("get contract", err),
+        })?;
+
+    let deployments: Vec<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 
+         ORDER BY deployed_at DESC",
+    )
+    .bind(contract.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get deployments", err))?;
+
+    let active = deployments.iter().find(|d| matches!(d.status, DeploymentStatus::Active));
+    let blue = deployments.iter().find(|d| matches!(d.environment, DeploymentEnvironment::Blue));
+    let green = deployments.iter().find(|d| matches!(d.environment, DeploymentEnvironment::Green));
+
+    Ok(Json(serde_json::json!({
+        "contract_id": contract_id,
+        "active": active,
+        "blue": blue,
+        "green": green
+    })))
+}
+
+pub async fn route_not_found() -> ApiError {
+    ApiError::not_found("RouteNotFound", "The requested endpoint does not exist")
+}
+
+use std::time::Duration;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct CacheParams {
+    pub cache: Option<String>,
+}
+
+pub async fn get_contract_state(
+    State(state): State<AppState>,
+    Path((contract_id, key)): Path<(String, String)>,
+    Query(params): Query<CacheParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let use_cache = params.cache.as_deref() == Some("on");
+
+    // Try cache first if enabled
+    if use_cache {
+        let (cached_value, was_hit) = state.cache.get(&contract_id, &key).await;
+        if was_hit && cached_value.is_some() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached_value.unwrap()) {
+                 return Ok(Json(val));
+            }
+        }
+    }
+
+    // Cache miss or cache disabled - fetch fresh value
+    let fetch_start = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(100)).await; // Simulate contract read latency
+    let fetch_duration = fetch_start.elapsed();
+    
+    let value = serde_json::json!({ 
+        "contract_id": contract_id,
+        "key": key,
+        "value": &format!("state_of_{}_{}", contract_id, key), 
+        "fetched_at": &chrono::Utc::now().to_rfc3339() 
+    });
+    
+    // Always record latency for baseline metrics
+    if use_cache {
+        // Record the full miss latency for metrics
+        state.cache.put(&contract_id, &key, value.to_string(), None).await;
+    } else {
+        // Record as uncached baseline when cache=off
+        state.cache.record_uncached_latency(fetch_duration);
+    }
+
+    Ok(Json(value))
+}
+
+pub async fn update_contract_state(
+    State(state): State<AppState>,
+    Path((contract_id, key)): Path<(String, String)>,
+    Json(_payload): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    state.cache.invalidate(&contract_id, &key).await;
+    Ok(Json(serde_json::json!({ "status": "updated", "invalidated": true })))
+}
+
+pub async fn get_cache_stats(
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let metrics = state.cache.metrics();
+    let hits = metrics.hits.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = metrics.misses.load(std::sync::atomic::Ordering::Relaxed);
+    let cached_hit_count = metrics.cached_hit_count.load(std::sync::atomic::Ordering::Relaxed);
+    let cache_miss_count = metrics.cache_miss_count.load(std::sync::atomic::Ordering::Relaxed);
+    
+    Ok(Json(serde_json::json!({
+        "metrics": {
+            "hit_rate_percent": metrics.hit_rate(),
+            "avg_cached_hit_latency_us": metrics.avg_cached_hit_latency(),
+            "avg_cache_miss_latency_us": metrics.avg_cache_miss_latency(),
+            "avg_uncached_latency_us": metrics.avg_uncached_latency(),
+            "improvement_factor": metrics.improvement_factor(),
+            "hits": hits,
+            "misses": misses,
+            "cached_hit_entries_count": cached_hit_count,
+            "cache_miss_entries_count": cache_miss_count,
+        },
+        "config": {
+            "enabled": state.cache.config().enabled,
+            "policy": format!("{:?}", state.cache.config().policy),
+            "ttl_seconds": state.cache.config().global_ttl.as_secs(),
+            "max_capacity": state.cache.config().max_capacity,
+        }
+    })))
+}
+pub mod migrations;
+
+
+use axum::{
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        Path, Query, State,
+    },
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+pub mod migrations;
+
+use axum::{
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        Path, Query, State,
+    },
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use rust_decimal::Decimal;
+use shared::{
+    AbTest, AbTestAssignment, AbTestMetric, AbTestResult, AbTestStatus, AbTestVariant,
+    AdvanceCanaryRequest, AlertSeverity, CanaryMetric, CanaryRelease, CanaryStatus,
+    CanaryUserAssignment, Contract, ContractDependency, ContractDeployment, ContractSearchParams,
+    ContractVersion, CreateAbTestRequest, CreateAlertConfigRequest, CreateCanaryRequest,
+    DeployGreenRequest, DependencyTreeNode, DeploymentEnvironment, DeploymentStatus,
+    DeploymentSwitch, GetVariantRequest, HealthCheckRequest, MetricType, PaginatedResponse,
+    PerformanceAlert, PerformanceAlertConfig, PerformanceAnomaly, PerformanceMetric,
+    PerformanceTrend, PublishRequest, Publisher, RecordAbTestMetricRequest,
+    RecordCanaryMetricRequest, RecordPerformanceMetricRequest, RolloutStage,
+    SwitchDeploymentRequest, VariantType, VerifyRequest, VersionConstraint,
+};
+use rust_decimal::Decimal;
+use std::collections::HashSet;
+use std::str::FromStr;
+use uuid::Uuid;
+
+
+use crate::{
+    analytics,
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+
+pub fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
+    tracing::error!(operation = operation, error = ?err, "database operation failed");
+    ApiError::internal("An unexpected database error occurred")
+}
+
+fn map_json_rejection(err: JsonRejection) -> ApiError {
+    ApiError::bad_request(
+        "InvalidRequest",
+        format!("Invalid JSON payload: {}", err.body_text()),
+    )
+}
+
+fn map_query_rejection(err: QueryRejection) -> ApiError {
+    ApiError::bad_request(
+        "InvalidQuery",
+        format!("Invalid query parameters: {}", err.body_text()),
+    )
+}
+
+/// Health check Î“Ã‡Ã¶ probes DB connectivity and reports uptime.
+/// Returns 200 when everything is reachable, 503 when the database
+/// connection pool cannot satisfy a trivial query.
+pub async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let uptime = state.started_at.elapsed().as_secs();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Quick connectivity probe Î“Ã‡Ã¶ keeps the query as cheap as possible
+    // so that frequent polling from orchestrators doesn't add load.
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    if db_ok {
+        tracing::info!(uptime_secs = uptime, "health check passed");
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    } else {
+        tracing::warn!(
+            uptime_secs = uptime,
+            "health check degraded Î“Ã‡Ã¶ db unreachable"
+        );
+
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "degraded",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    }
+}
+
+/// Get registry statistics
+pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let total_contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count contracts", err))?;
+
+    let verified_contracts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE is_verified = true")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| db_internal_error("count verified contracts", err))?;
+
+    let total_publishers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publishers")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count publishers", err))?;
+
+    Ok(Json(serde_json::json!({
+        "total_contracts": total_contracts,
+        "verified_contracts": verified_contracts,
+        "total_publishers": total_publishers,
+    })))
+}
+
+/// List and search contracts
+pub async fn list_contracts(
+    State(state): State<AppState>,
+    params: Result<Query<ContractSearchParams>, QueryRejection>,
+) -> axum::response::Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(err) => return map_query_rejection(err).into_response(),
+    };
+
+    let page = params.page.unwrap_or(1);
+    let limit = params.limit.unwrap_or(20);
+
+    // bad input, bail early
+    if page < 1 || limit < 1 || limit > 100 {
+        return ApiError::bad_request(
+            "InvalidPagination",
+            "page must be >= 1 and limit must be between 1 and 100",
+        )
+        .into_response();
+    }
+
+    let offset = (page - 1) * limit;
+
+    // Build dynamic query based on filters
+    let mut query = String::from("SELECT * FROM contracts WHERE 1=1");
+    let mut count_query = String::from("SELECT COUNT(*) FROM contracts WHERE 1=1");
+
+    if let Some(ref q) = params.query {
+        let search_clause = format!(" AND (name ILIKE '%{}%' OR description ILIKE '%{}%')", q, q);
+        query.push_str(&search_clause);
+        count_query.push_str(&search_clause);
+    }
+
+    if let Some(verified) = params.verified_only {
+        if verified {
+            query.push_str(" AND is_verified = true");
+            count_query.push_str(" AND is_verified = true");
+        }
+    }
+
+    if let Some(ref category) = params.category {
+        let category_clause = format!(" AND category = '{}'", category);
+        query.push_str(&category_clause);
+        count_query.push_str(&category_clause);
+    }
+
+    query.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT {} OFFSET {}",
+        limit, offset
+    ));
+
+    let contracts: Vec<Contract> = match sqlx::query_as(&query).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(err) => return db_internal_error("list contracts", err).into_response(),
+    };
+
+    let total: i64 = match sqlx::query_scalar(&count_query).fetch_one(&state.db).await {
+        Ok(n) => n,
+        Err(err) => return db_internal_error("count filtered contracts", err).into_response(),
+    };
+
+    let paginated = PaginatedResponse::new(contracts, total, page, limit);
+
+    // link headers for pagination
+    let total_pages = paginated.total_pages;
+    let mut links: Vec<String> = Vec::new();
+
+    if page > 1 {
+        links.push(format!(
+            "</api/contracts?page={}&limit={}>; rel=\"prev\"",
+            page - 1,
+            limit
+        ));
+    }
+    if page < total_pages {
+        links.push(format!(
+            "</api/contracts?page={}&limit={}>; rel=\"next\"",
+            page + 1,
+            limit
+        ));
+    }
+
+    let mut response = (StatusCode::OK, Json(paginated)).into_response();
+
+    if !links.is_empty() {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&links.join(", ")) {
+            response.headers_mut().insert("link", value);
+        }
+    }
+
+    response
+}
+
+pub async fn get_contract(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Contract>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract by id", err),
+        })?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    if let Some(deployment) = active_deployment {
+        let mut contract_with_deployment = contract.clone();
+        contract_with_deployment.wasm_hash = deployment.wasm_hash;
+        Ok(Json(contract_with_deployment))
+    } else {
+        Ok(Json(contract))
+    }
+}
+
+/// Get contract ABI
+pub async fn get_contract_abi(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let abi: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT abi FROM contracts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    abi.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Get contract version history
+pub async fn get_contract_versions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<ContractVersion>>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    let versions: Vec<ContractVersion> = sqlx::query_as(
+        "SELECT * FROM contract_versions WHERE contract_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("list versions", err))?;
+
+    Ok(Json(versions))
+}
+
+/// Publish a new contract
+pub async fn publish_contract(
+    State(state): State<AppState>,
+    payload: Result<Json<PublishRequest>, JsonRejection>,
+) -> ApiResult<Json<Contract>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    // First, ensure publisher exists or create one
+    let publisher: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address) VALUES ($1)
+         ON CONFLICT (stellar_address) DO UPDATE SET stellar_address = EXCLUDED.stellar_address
+         RETURNING *",
+    )
+    .bind(&req.publisher_address)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("upsert publisher", err))?;
+
+    // TODO: Fetch WASM hash from Stellar network
+    let wasm_hash = "placeholder_hash".to_string();
+
+    let contract: Contract = sqlx::query_as(
+        "INSERT INTO contracts (contract_id, wasm_hash, name, description, publisher_id, network, category, tags)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *",
+    )
+    .bind(&req.contract_id)
+    .bind(&wasm_hash)
+    .bind(&req.name)
+    .bind(&req.description)
+    .bind(publisher.id)
+    .bind(&req.network)
+    .bind(&req.category)
+    .bind(&req.tags)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create contract", err))?;
+
+    // Fire-and-forget analytics event
+    let pool = state.db.clone();
+    let cid = contract.id;
+    let addr = req.publisher_address.clone();
+    let net = contract.network.clone();
+    tokio::spawn(async move {
+        if let Err(err) = analytics::record_event(
+            &pool,
+            AnalyticsEventType::ContractPublished,
+            cid,
+            Some(&addr),
+            Some(&net),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(error = ?err, "failed to record contract_published event");
+        }
+    });
+    sqlx::query(
+        "INSERT INTO contract_deployments (contract_id, environment, status, wasm_hash, activated_at)
+         VALUES ($1, 'blue', 'active', $2, NOW())
+         ON CONFLICT (contract_id, environment) DO NOTHING",
+    )
+    .bind(contract.id)
+    .bind(&wasm_hash)
+    .execute(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create initial blue deployment", err))?;
+
+    Ok(Json(contract))
+}
+
+/// Verify a contract
+pub async fn verify_contract(
+    State(state): State<AppState>,
+    payload: Result<Json<VerifyRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    // TODO: Implement full verification logic
+
+    // Fire-and-forget analytics event
+    // We parse the contract_id string as UUID for the event; if it fails we skip.
+    if let Ok(cid) = Uuid::parse_str(&req.contract_id) {
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(err) = analytics::record_event(
+                &pool,
+                AnalyticsEventType::ContractVerified,
+                cid,
+                None,
+                None,
+                Some(serde_json::json!({ "compiler_version": req.compiler_version })),
+            )
+            .await
+            {
+                tracing::warn!(error = ?err, "failed to record contract_verified event");
+            }
+        });
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "message": "Verification started"
+    })))
+}
+
+/// Create a publisher
+pub async fn create_publisher(
+    State(state): State<AppState>,
+    payload: Result<Json<Publisher>, JsonRejection>,
+) -> ApiResult<Json<Publisher>> {
+    let Json(publisher) = payload.map_err(map_json_rejection)?;
+
+    let created: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address, username, email, github_url, website)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *",
+    )
+    .bind(&publisher.stellar_address)
+    .bind(&publisher.username)
+    .bind(&publisher.email)
+    .bind(&publisher.github_url)
+    .bind(&publisher.website)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create publisher", err))?;
+
+    Ok(Json(created))
+}
+
+/// Get publisher by ID
+pub async fn get_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Publisher>> {
+    let publisher: Publisher = sqlx::query_as("SELECT * FROM publishers WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "PublisherNotFound",
+                format!("No publisher found with ID: {}", id),
+            ),
+            _ => db_internal_error("get publisher by id", err),
+        })?;
+
+    Ok(Json(publisher))
+}
+
+/// Get all contracts by a publisher
+pub async fn get_publisher_contracts(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Vec<Contract>>> {
+    let contracts: Vec<Contract> =
+        sqlx::query_as("SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC")
+            .bind(id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_internal_error("list publisher contracts", err))?;
+
+    Ok(Json(contracts))
+}
+
+/// Get analytics for a specific contract
+pub async fn get_contract_analytics(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ContractAnalyticsResponse>> {
+    // Verify the contract exists
+    let _contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract for analytics", err),
+        })?;
+
+    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
+
+    // Deployment stats
+    let deploy_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("deployment count", e))?;
+
+    let unique_deployers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed' AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique deployers", e))?;
+
+    let by_network: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT COALESCE(jsonb_object_agg(COALESCE(network::text, 'unknown'), cnt), '{}'::jsonb)
+        FROM (SELECT network, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $1 AND event_type = 'contract_deployed' GROUP BY network) sub"#,
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("network breakdown", e))?;
+
+    let unique_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events WHERE contract_id = $1 AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique interactors", e))?;
+
+    let top_user_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_address, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $1 AND user_address IS NOT NULL GROUP BY user_address ORDER BY cnt DESC LIMIT 10",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("top users", e))?;
+
+    let top_users: Vec<TopUser> = top_user_rows
+        .into_iter()
+        .map(|(address, count)| TopUser { address, count })
+        .collect();
+
+    let timeline_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"SELECT d::date AS date, COALESCE(e.cnt, 0) AS count
+        FROM generate_series(($1::timestamptz)::date, CURRENT_DATE, '1 day'::interval) d
+        LEFT JOIN (SELECT DATE(created_at) AS event_date, COUNT(*) AS cnt FROM analytics_events WHERE contract_id = $2 AND created_at >= $1 GROUP BY DATE(created_at)) e ON d::date = e.event_date
+        ORDER BY d::date"#,
+    )
+    .bind(thirty_days_ago)
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("timeline", e))?;
+
+    let timeline: Vec<TimelineEntry> = timeline_rows
+        .into_iter()
+        .map(|(date, count)| TimelineEntry { date, count })
+        .collect();
+
+    Ok(Json(ContractAnalyticsResponse {
+        contract_id: id,
+        deployments: DeploymentStats {
+            count: deploy_count,
+            unique_users: unique_deployers,
+            by_network,
+        },
+        interactors: InteractorStats {
+            unique_count,
+            top_users,
+        },
+        timeline,
+    }))
+}
+pub async fn deploy_green(
+    State(state): State<AppState>,
+    payload: Result<Json<DeployGreenRequest>, JsonRejection>,
+) -> ApiResult<Json<ContractDeployment>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract for analytics", err),
+        })?;
+
+    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
+
+    // Î“Ã¶Ã‡Î“Ã¶Ã‡ Deployment stats Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡
+    let deploy_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM analytics_events \
+         WHERE contract_id = $1 AND event_type = 'contract_deployed'",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("deployment count", e))?;
+
+    let unique_deployers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events \
+         WHERE contract_id = $1 AND event_type = 'contract_deployed' AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique deployers", e))?;
+
+    let by_network: serde_json::Value = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(
+            jsonb_object_agg(COALESCE(network::text, 'unknown'), cnt),
+            '{}'::jsonb
+        )
+        FROM (
+            SELECT network, COUNT(*) AS cnt
+            FROM analytics_events
+            WHERE contract_id = $1 AND event_type = 'contract_deployed'
+            GROUP BY network
+        ) sub
+        "#,
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("network breakdown", e))?;
+
+    // Î“Ã¶Ã‡Î“Ã¶Ã‡ Interactor stats Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡
+    let unique_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT user_address) FROM analytics_events \
+         WHERE contract_id = $1 AND user_address IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_internal_error("unique interactors", e))?;
+
+    let top_user_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_address, COUNT(*) AS cnt FROM analytics_events \
+         WHERE contract_id = $1 AND user_address IS NOT NULL \
+         GROUP BY user_address ORDER BY cnt DESC LIMIT 10",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("top users", e))?;
+
+    let top_users: Vec<TopUser> = top_user_rows
+        .into_iter()
+        .map(|(address, count)| TopUser { address, count })
+        .collect();
+
+    // Î“Ã¶Ã‡Î“Ã¶Ã‡ Timeline (last 30 days) Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡
+    let timeline_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"
+        SELECT d::date AS date, COALESCE(e.cnt, 0) AS count
+        FROM generate_series(
+            ($1::timestamptz)::date,
+            CURRENT_DATE,
+            '1 day'::interval
+        ) d
+        LEFT JOIN (
+            SELECT DATE(created_at) AS event_date, COUNT(*) AS cnt
+            FROM analytics_events
+            WHERE contract_id = $2
+              AND created_at >= $1
+            GROUP BY DATE(created_at)
+        ) e ON d::date = e.event_date
+        ORDER BY d::date
+        "#,
+    )
+    .bind(thirty_days_ago)
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_internal_error("timeline", e))?;
+
+    let timeline: Vec<TimelineEntry> = timeline_rows
+        .into_iter()
+        .map(|(date, count)| TimelineEntry { date, count })
+        .collect();
+
+    // Î“Ã¶Ã‡Î“Ã¶Ã‡ Build response Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡Î“Ã¶Ã‡
+    Ok(Json(ContractAnalyticsResponse {
+        contract_id: id,
+        deployments: DeploymentStats {
+            count: deploy_count,
+            unique_users: unique_deployers,
+            by_network,
+        },
+        interactors: InteractorStats {
+            unique_count,
+            top_users,
+        },
+        timeline,
+    }))
+}
+
+pub async fn switch_deployment(
+    State(state): State<AppState>,
+    payload: Result<Json<SwitchDeploymentRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+    let force = req.force.unwrap_or(false);
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", req.contract_id),
+            ),
+            _ => db_internal_error("get contract for switch", err),
+        })?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| db_internal_error("begin transaction for switch", err))?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    let from_env = active_deployment
+        .as_ref()
+        .map(|d| d.environment.clone())
+        .unwrap_or(DeploymentEnvironment::Blue);
+
+    let to_env = match from_env {
+        DeploymentEnvironment::Blue => DeploymentEnvironment::Green,
+        DeploymentEnvironment::Green => DeploymentEnvironment::Blue,
+    };
+
+    let green_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND environment = 'green'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get green deployment", err))?;
+
+    if let Some(ref green) = green_deployment {
+        if !force && green.status != DeploymentStatus::Testing {
+            return Err(ApiError::bad_request(
+                "InvalidDeploymentStatus",
+                "Green deployment must be in testing status before switch",
+            ));
+        }
+        if !force && green.health_checks_passed < 3 {
+            return Err(ApiError::bad_request(
+                "InsufficientHealthChecks",
+                "Green deployment must pass at least 3 health checks before switch",
+            ));
+        }
+    } else {
+        return Err(ApiError::bad_request(
+            "NoGreenDeployment",
+            "No green deployment found",
+        ));
+    }
+
+    if let Some(ref active) = active_deployment {
+        sqlx::query("UPDATE contract_deployments SET status = 'inactive' WHERE id = $1")
+            .bind(active.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("deactivate current deployment", err))?;
+    }
+
+    sqlx::query(
+        "UPDATE contract_deployments 
+         SET status = 'active', activated_at = NOW() 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("activate new deployment", err))?;
+
+    sqlx::query_as::<_, DeploymentSwitch>(
+        "INSERT INTO deployment_switches (contract_id, from_environment, to_environment)
+         VALUES ($1, $2, $3)
+         RETURNING *",
+    )
+    .bind(contract.id)
+    .bind(&from_env)
+    .bind(&to_env)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("record deployment switch", err))?;
+
+    tx.commit()
+        .await
+        .map_err(|err| db_internal_error("commit deployment switch", err))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "switched_from": from_env,
+        "switched_to": to_env,
+        "contract_id": req.contract_id
+    })))
+}
+
+pub async fn rollback_deployment(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", contract_id),
+            ),
+            _ => db_internal_error("get contract for rollback", err),
+        })?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| db_internal_error("begin transaction for rollback", err))?;
+
+    let active_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND status = 'active'",
+    )
+    .bind(contract.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get active deployment", err))?;
+
+    let from_env = active_deployment
+        .as_ref()
+        .map(|d| d.environment.clone())
+        .unwrap_or(DeploymentEnvironment::Green);
+
+    let to_env = match from_env {
+        DeploymentEnvironment::Blue => DeploymentEnvironment::Green,
+        DeploymentEnvironment::Green => DeploymentEnvironment::Blue,
+    };
+
+    let target_deployment: Option<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("get target deployment", err))?;
+
+    if target_deployment.is_none() {
+        return Err(ApiError::bad_request(
+            "NoDeploymentToRollback",
+            format!("No {} deployment found to rollback to", to_env),
+        ));
+    }
+
+    if let Some(ref active) = active_deployment {
+        sqlx::query("UPDATE contract_deployments SET status = 'inactive' WHERE id = $1")
+            .bind(active.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("deactivate current deployment", err))?;
+    }
+
+    sqlx::query(
+        "UPDATE contract_deployments 
+         SET status = 'active', activated_at = NOW() 
+         WHERE contract_id = $1 AND environment = $2",
+    )
+    .bind(contract.id)
+    .bind(&to_env)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("activate rollback deployment", err))?;
+
+    sqlx::query_as::<_, DeploymentSwitch>(
+        "INSERT INTO deployment_switches (contract_id, from_environment, to_environment, rollback)
+         VALUES ($1, $2, $3, true)
+         RETURNING *",
+    )
+    .bind(contract.id)
+    .bind(&from_env)
+    .bind(&to_env)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| db_internal_error("record rollback switch", err))?;
+
+    tx.commit()
+        .await
+        .map_err(|err| db_internal_error("commit rollback", err))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rolled_back_from": from_env,
+        "rolled_back_to": to_env,
+        "contract_id": contract_id
+    })))
+}
+
+pub async fn report_health_check(
+    State(state): State<AppState>,
+    payload: Result<Json<HealthCheckRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&req.contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", req.contract_id),
+            ),
+            _ => db_internal_error("get contract for health check", err),
+        })?;
+
+    let env_str = match req.environment {
+        DeploymentEnvironment::Blue => "blue",
+        DeploymentEnvironment::Green => "green",
+    };
+
+    if req.passed {
+        sqlx::query(
+            "UPDATE contract_deployments 
+             SET health_checks_passed = health_checks_passed + 1, 
+                 last_health_check_at = NOW()
+             WHERE contract_id = $1 AND environment = $2",
+        )
+        .bind(contract.id)
+        .bind(&req.environment)
+        .execute(&state.db)
+        .await
+        .map_err(|err| db_internal_error("update health check passed", err))?;
+    } else {
+        sqlx::query(
+            "UPDATE contract_deployments 
+             SET health_checks_failed = health_checks_failed + 1, 
+                 status = CASE WHEN health_checks_failed + 1 >= 3 THEN 'failed' ELSE status END,
+                 last_health_check_at = NOW()
+             WHERE contract_id = $1 AND environment = $2",
+        )
+        .bind(contract.id)
+        .bind(&req.environment)
+        .execute(&state.db)
+        .await
+        .map_err(|err| db_internal_error("update health check failed", err))?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "environment": env_str,
+        "passed": req.passed
+    })))
+}
+
+pub async fn get_deployment_status(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE contract_id = $1")
+        .bind(&contract_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("Contract not found: {}", contract_id),
+            ),
+            _ => db_internal_error("get contract", err),
+        })?;
+
+    let deployments: Vec<ContractDeployment> = sqlx::query_as(
+        "SELECT * FROM contract_deployments 
+         WHERE contract_id = $1 
+         ORDER BY deployed_at DESC",
+    )
+    .bind(contract.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get deployments", err))?;
+
+    let active = deployments
+        .iter()
+        .find(|d| matches!(d.status, DeploymentStatus::Active));
+    let blue = deployments
+        .iter()
+        .find(|d| matches!(d.environment, DeploymentEnvironment::Blue));
+    let green = deployments
+        .iter()
+        .find(|d| matches!(d.environment, DeploymentEnvironment::Green));
+
+    Ok(Json(serde_json::json!({
+        "contract_id": contract_id,
+        "active": active,
+        "blue": blue,
+        "green": green
+    })))
+}
+
+pub async fn route_not_found() -> ApiError {
+    ApiError::not_found("RouteNotFound", "The requested endpoint does not exist")
+}
+
+use serde::Deserialize;
+use std::time::Duration;
+
+#[derive(Deserialize)]
+pub struct CacheParams {
+    pub cache: Option<String>,
+}
+
+pub async fn get_contract_state(
+    State(state): State<AppState>,
+    Path((contract_id, key)): Path<(String, String)>,
+    Query(params): Query<CacheParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let use_cache = params.cache.as_deref() == Some("on");
+
+    // Try cache first if enabled
+    if use_cache {
+        let (cached_value, was_hit) = state.cache.get(&contract_id, &key).await;
+        if was_hit && cached_value.is_some() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached_value.unwrap()) {
+                return Ok(Json(val));
+            }
+        }
+    }
+
+    // Cache miss or cache disabled - fetch fresh value
+    let fetch_start = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(100)).await; // Simulate contract read latency
+    let fetch_duration = fetch_start.elapsed();
+
+    let value = serde_json::json!({
+        "contract_id": contract_id,
+        "key": key,
+        "value": &format!("state_of_{}_{}", contract_id, key),
+        "fetched_at": &chrono::Utc::now().to_rfc3339()
+    });
+
+    // Always record latency for baseline metrics
+    if use_cache {
+        // Record the full miss latency for metrics
+        state
+            .cache
+            .put(&contract_id, &key, value.to_string(), None)
+            .await;
+    } else {
+        // Record as uncached baseline when cache=off
+        state.cache.record_uncached_latency(fetch_duration);
+    }
+
+    Ok(Json(value))
+}
+
+pub async fn update_contract_state(
+    State(state): State<AppState>,
+    Path((contract_id, key)): Path<(String, String)>,
+    Json(_payload): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    state.cache.invalidate(&contract_id, &key).await;
+    Ok(Json(
+        serde_json::json!({ "status": "updated", "invalidated": true }),
+    ))
+}
+
+pub async fn get_cache_stats(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let metrics = state.cache.metrics();
+    let hits = metrics.hits.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = metrics.misses.load(std::sync::atomic::Ordering::Relaxed);
+    let cached_hit_count = metrics
+        .cached_hit_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_miss_count = metrics
+        .cache_miss_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    Ok(Json(serde_json::json!({
+        "metrics": {
+            "hit_rate_percent": metrics.hit_rate(),
+            "avg_cached_hit_latency_us": metrics.avg_cached_hit_latency(),
+            "avg_cache_miss_latency_us": metrics.avg_cache_miss_latency(),
+            "avg_uncached_latency_us": metrics.avg_uncached_latency(),
+            "improvement_factor": metrics.improvement_factor(),
+            "hits": hits,
+            "misses": misses,
+            "cached_hit_entries_count": cached_hit_count,
+            "cache_miss_entries_count": cache_miss_count,
+        },
+        "config": {
+            "enabled": state.cache.config().enabled,
+            "policy": format!("{:?}", state.cache.config().policy),
+            "ttl_seconds": state.cache.config().global_ttl.as_secs(),
+            "max_capacity": state.cache.config().max_capacity,
+        }
+    })))
+}
+
 pub async fn create_ab_test(
     State(state): State<AppState>,
     payload: Result<Json<CreateAbTestRequest>, JsonRejection>,
@@ -1004,14 +3591,20 @@ pub async fn create_ab_test(
     let variant_a_uuid = Uuid::parse_str(&req.variant_a_deployment_id).map_err(|_| {
         ApiError::bad_request(
             "InvalidDeploymentId",
-            format!("Invalid variant A deployment ID: {}", req.variant_a_deployment_id),
+            format!(
+                "Invalid variant A deployment ID: {}",
+                req.variant_a_deployment_id
+            ),
         )
     })?;
 
     let variant_b_uuid = Uuid::parse_str(&req.variant_b_deployment_id).map_err(|_| {
         ApiError::bad_request(
             "InvalidDeploymentId",
-            format!("Invalid variant B deployment ID: {}", req.variant_b_deployment_id),
+            format!(
+                "Invalid variant B deployment ID: {}",
+                req.variant_b_deployment_id
+            ),
         )
     })?;
 
@@ -1021,9 +3614,11 @@ pub async fn create_ab_test(
     let significance_threshold = Decimal::try_from(req.significance_threshold.unwrap_or(95.0))
         .map_err(|_| ApiError::bad_request("InvalidThreshold", "Invalid significance threshold"))?;
 
-    let mut tx = state.db.begin().await.map_err(|err| {
-        db_internal_error("begin transaction for ab test", err)
-    })?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| db_internal_error("begin transaction for ab test", err))?;
 
     let test: AbTest = sqlx::query_as(
         "INSERT INTO ab_tests (
@@ -1061,9 +3656,9 @@ pub async fn create_ab_test(
     .await
     .map_err(|err| db_internal_error("create variants", err))?;
 
-    tx.commit().await.map_err(|err| {
-        db_internal_error("commit ab test", err)
-    })?;
+    tx.commit()
+        .await
+        .map_err(|err| db_internal_error("commit ab test", err))?;
 
     Ok(Json(test))
 }
@@ -1103,14 +3698,12 @@ pub async fn get_variant(
         ApiError::bad_request("InvalidTestId", format!("Invalid test ID: {}", req.test_id))
     })?;
 
-    let variant: Option<String> = sqlx::query_scalar(
-        "SELECT assign_variant($1, $2)",
-    )
-    .bind(test_uuid)
-    .bind(&req.user_address)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| db_internal_error("get variant", err))?;
+    let variant: Option<String> = sqlx::query_scalar("SELECT assign_variant($1, $2)")
+        .bind(test_uuid)
+        .bind(&req.user_address)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| db_internal_error("get variant", err))?;
 
     if let Some(v) = variant {
         Ok(Json(serde_json::json!({
@@ -1147,7 +3740,9 @@ pub async fn record_ab_test_metric(
         .await
         .map_err(|err| db_internal_error("get assignment", err))?;
 
-        assignment.unwrap_or_else(|| {
+        if let Some(a) = assignment {
+            a
+        } else {
             let hash = (test_uuid.to_string() + user_addr).as_bytes();
             let hash_val = (hash.iter().map(|&b| b as u32).sum::<u32>() % 100) as i32;
             let test: AbTest = sqlx::query_as("SELECT * FROM ab_tests WHERE id = $1")
@@ -1156,13 +3751,13 @@ pub async fn record_ab_test_metric(
                 .await
                 .ok()
                 .unwrap();
-            
+
             if hash_val < test.traffic_split.to_string().parse::<i32>().unwrap_or(50) {
                 VariantType::Control
             } else {
                 VariantType::Treatment
             }
-        })
+        }
     } else {
         return Err(ApiError::bad_request(
             "UserAddressRequired",
@@ -1205,10 +3800,9 @@ pub async fn get_ab_test_results(
         .fetch_one(&state.db)
         .await
         .map_err(|err| match err {
-            sqlx::Error::RowNotFound => ApiError::not_found(
-                "TestNotFound",
-                format!("Test not found: {}", test_id),
-            ),
+            sqlx::Error::RowNotFound => {
+                ApiError::not_found("TestNotFound", format!("Test not found: {}", test_id))
+            }
             _ => db_internal_error("get test", err),
         })?;
 
@@ -1336,9 +3930,15 @@ pub async fn get_ab_test_results(
     });
 
     let winner = if let (Some(c_mean), Some(t_mean)) = (control_mean, treatment_mean) {
-        if t_mean > c_mean && significance.is_some() && significance.unwrap() >= test.significance_threshold {
+        if t_mean > c_mean
+            && significance.is_some()
+            && significance.unwrap() >= test.significance_threshold
+        {
             Some("treatment")
-        } else if c_mean > t_mean && significance.is_some() && significance.unwrap() >= test.significance_threshold {
+        } else if c_mean > t_mean
+            && significance.is_some()
+            && significance.unwrap() >= test.significance_threshold
+        {
             Some("control")
         } else {
             None
@@ -1403,10 +4003,9 @@ pub async fn rollout_winning_variant(
         .fetch_one(&state.db)
         .await
         .map_err(|err| match err {
-            sqlx::Error::RowNotFound => ApiError::not_found(
-                "TestNotFound",
-                format!("Test not found: {}", test_id),
-            ),
+            sqlx::Error::RowNotFound => {
+                ApiError::not_found("TestNotFound", format!("Test not found: {}", test_id))
+            }
             _ => db_internal_error("get test", err),
         })?;
 
@@ -1427,9 +4026,11 @@ pub async fn rollout_winning_variant(
         test.variant_a_deployment_id
     };
 
-    let mut tx = state.db.begin().await.map_err(|err| {
-        db_internal_error("begin transaction for rollout", err)
-    })?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| db_internal_error("begin transaction for rollout", err))?;
 
     sqlx::query(
         "UPDATE ab_tests 
@@ -1451,9 +4052,9 @@ pub async fn rollout_winning_variant(
     .await
     .map_err(|err| db_internal_error("activate deployment", err))?;
 
-    tx.commit().await.map_err(|err| {
-        db_internal_error("commit rollout", err)
-    })?;
+    tx.commit()
+        .await
+        .map_err(|err| db_internal_error("commit rollout", err))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1473,10 +4074,9 @@ async fn get_ab_test_results_internal(
         .fetch_one(&state.db)
         .await
         .map_err(|err| match err {
-            sqlx::Error::RowNotFound => ApiError::not_found(
-                "TestNotFound",
-                format!("Test not found: {}", test_uuid),
-            ),
+            sqlx::Error::RowNotFound => {
+                ApiError::not_found("TestNotFound", format!("Test not found: {}", test_uuid))
+            }
             _ => db_internal_error("get test", err),
         })?;
 
@@ -1662,7 +4262,9 @@ fn identify_slow_functions(metrics: &[PerformanceMetric]) -> Vec<serde_json::Val
     for metric in metrics {
         if metric.metric_type == MetricType::ExecutionTime {
             if let Some(ref func_name) = metric.function_name {
-                let entry = function_stats.entry(func_name.clone()).or_insert_with(|| (Vec::new(), 0));
+                let entry = function_stats
+                    .entry(func_name.clone())
+                    .or_insert_with(|| (Vec::new(), 0));
                 if let Ok(val) = metric.value.to_string().parse::<f64>() {
                     entry.0.push(val);
                 }
@@ -1680,7 +4282,11 @@ fn identify_slow_functions(metrics: &[PerformanceMetric]) -> Vec<serde_json::Val
         .into_iter()
         .map(|(name, (values, count))| {
             let sum: f64 = values.iter().sum();
-            let avg = if values.is_empty() { 0.0 } else { sum / values.len() as f64 };
+            let avg = if values.is_empty() {
+                0.0
+            } else {
+                sum / values.len() as f64
+            };
             let max = values.iter().copied().fold(0.0, f64::max);
             serde_json::json!({
                 "function_name": name,
@@ -1694,7 +4300,9 @@ fn identify_slow_functions(metrics: &[PerformanceMetric]) -> Vec<serde_json::Val
     slow_functions.sort_by(|a, b| {
         let a_val = a["avg_execution_time"].as_f64().unwrap_or(0.0);
         let b_val = b["avg_execution_time"].as_f64().unwrap_or(0.0);
-        b_val.partial_cmp(&a_val).unwrap_or(std::cmp::Ordering::Equal)
+        b_val
+            .partial_cmp(&a_val)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     slow_functions.into_iter().take(10).collect()
@@ -1796,4 +4404,502 @@ pub async fn acknowledge_alert(
         "success": true,
         "alert_id": alert_id
     })))
+}
+
+
+/// Get contract dependencies (recursive tree)
+pub async fn get_contract_dependencies(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<DependencyTreeNode>>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    // Helper to recursively fetch dependencies
+    // Note: In production, we'd want to limit recursion depth
+    async fn fetch_deps(
+        pool: &sqlx::PgPool,
+        contract_id: Uuid,
+        visited: &mut HashSet<Uuid>,
+    ) -> ApiResult<Vec<DependencyTreeNode>> {
+        if visited.contains(&contract_id) {
+            return Err(ApiError::bad_request(
+                "CircularDependency",
+                "Circular dependency detected",
+            ));
+        }
+        visited.insert(contract_id);
+
+        let deps: Vec<ContractDependency> =
+            sqlx::query_as("SELECT * FROM contract_dependencies WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|err| db_internal_error("fetch dependencies", err))?;
+
+        let mut nodes = Vec::new();
+        for dep in deps {
+            // If dependency points to a valid contract, fetch it to get details
+            if let Some(dep_contract_id) = dep.dependency_contract_id {
+                let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+                    .bind(dep_contract_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|err| db_internal_error("fetch dependent contract", err))?;
+
+                // Recursively fetch sub-dependencies
+                // We clone visited for each branch to allow shared dependencies (diamond problem)
+                // but avoid cycles in the current path.
+                let mut path_visited = visited.clone();
+                let sub_deps =
+                    Box::pin(fetch_deps(pool, dep_contract_id, &mut path_visited)).await?;
+
+                nodes.push(DependencyTreeNode {
+                    contract_id: contract.contract_id,
+                    name: contract.name,
+                    current_version: "1.0.0".to_string(), // TODO: fetch actual version
+                    constraint_to_parent: dep.version_constraint,
+                    dependencies: sub_deps,
+                });
+            } else {
+                // Dependency not found in registry (unresolved)
+                nodes.push(DependencyTreeNode {
+                    contract_id: "unknown".to_string(),
+                    name: dep.dependency_name,
+                    current_version: "unknown".to_string(),
+                    constraint_to_parent: dep.version_constraint,
+                    dependencies: Vec::new(),
+                });
+            }
+        }
+
+        Ok(nodes)
+    }
+
+    let mut visited = HashSet::new();
+    let tree = fetch_deps(&state.db, contract_uuid, &mut visited).await?;
+
+    Ok(Json(tree))
+}
+
+/// Get contracts that depend on this one
+pub async fn get_contract_dependents(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    // Join contract_dependencies with contracts to get details of the dependent
+    let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.name, c.contract_id, cd.version_constraint 
+         FROM contract_dependencies cd
+         JOIN contracts c ON cd.contract_id = c.id
+         WHERE cd.dependency_contract_id = $1",
+    )
+    .bind(contract_uuid)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch dependents", err))?;
+
+    let dependents = rows
+        .into_iter()
+        .map(|(id, name, contract_id, constraint)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "contract_id": contract_id,
+                "required_version": constraint
+            })
+        })
+        .collect();
+
+    Ok(Json(dependents))
+}
+
+use axum::{
+    http::StatusCode,
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        Path, Query, State,
+    },
+    Json,
+};
+use shared::{
+    Contract, ContractHealth, ContractSearchParams, ContractVersion, PaginatedResponse, PublishRequest, Publisher,
+    VerifyRequest,
+};
+use uuid::Uuid;
+
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+
+fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
+    tracing::error!(operation = operation, error = ?err, "database operation failed");
+    ApiError::internal("An unexpected database error occurred")
+}
+
+fn map_json_rejection(err: JsonRejection) -> ApiError {
+    ApiError::bad_request("InvalidRequest", format!("Invalid JSON payload: {}", err.body_text()))
+}
+
+fn map_query_rejection(err: QueryRejection) -> ApiError {
+    ApiError::bad_request("InvalidQuery", format!("Invalid query parameters: {}", err.body_text()))
+}
+
+/// Health check — probes DB connectivity and reports uptime.
+/// Returns 200 when everything is reachable, 503 when the database
+/// connection pool cannot satisfy a trivial query.
+pub async fn health_check(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let uptime = state.started_at.elapsed().as_secs();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Quick connectivity probe — keeps the query as cheap as possible
+    // so that frequent polling from orchestrators doesn't add load.
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    if db_ok {
+        tracing::info!(uptime_secs = uptime, "health check passed");
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    } else {
+        tracing::warn!(uptime_secs = uptime, "health check degraded — db unreachable");
+
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "degraded",
+                "version": "0.1.0",
+                "timestamp": now,
+                "uptime_secs": uptime
+            })),
+        )
+    }
+}
+
+/// Get registry statistics
+pub async fn get_stats(
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let total_contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count contracts", err))?;
+
+    let verified_contracts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE is_verified = true")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count verified contracts", err))?;
+
+    let total_publishers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publishers")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count publishers", err))?;
+
+    Ok(Json(serde_json::json!({
+        "total_contracts": total_contracts,
+        "verified_contracts": verified_contracts,
+        "total_publishers": total_publishers,
+    })))
+}
+
+/// List and search contracts
+pub async fn list_contracts(
+    State(state): State<AppState>,
+    params: Result<Query<ContractSearchParams>, QueryRejection>,
+) -> ApiResult<Json<PaginatedResponse<Contract>>> {
+    let Query(params) = params.map_err(map_query_rejection)?;
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(20).min(100);
+    let offset = (page - 1) * page_size;
+
+    // Build dynamic query based on filters
+    let mut query = String::from("SELECT * FROM contracts WHERE 1=1");
+    let mut count_query = String::from("SELECT COUNT(*) FROM contracts WHERE 1=1");
+
+    if let Some(ref q) = params.query {
+        let search_clause = format!(
+            " AND (name ILIKE '%{}%' OR description ILIKE '%{}%')",
+            q, q
+        );
+        query.push_str(&search_clause);
+        count_query.push_str(&search_clause);
+    }
+
+    if let Some(verified) = params.verified_only {
+        if verified {
+            query.push_str(" AND is_verified = true");
+            count_query.push_str(" AND is_verified = true");
+        }
+    }
+
+    if let Some(ref category) = params.category {
+        let category_clause = format!(" AND category = '{}'", category);
+        query.push_str(&category_clause);
+        count_query.push_str(&category_clause);
+    }
+
+    query.push_str(&format!(" ORDER BY created_at DESC LIMIT {} OFFSET {}", page_size, offset));
+
+    let contracts: Vec<Contract> = sqlx::query_as(&query)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| db_internal_error("list contracts", err))?;
+
+    let total: i64 = sqlx::query_scalar(&count_query)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| db_internal_error("count filtered contracts", err))?;
+
+    Ok(Json(PaginatedResponse::new(contracts, total, page, page_size)))
+}
+
+/// Get a specific contract by ID
+pub async fn get_contract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Contract>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    let contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(contract_uuid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("get contract by id", err),
+        })?;
+
+    Ok(Json(contract))
+}
+
+/// Get contract version history
+pub async fn get_contract_versions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<ContractVersion>>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    let versions: Vec<ContractVersion> = sqlx::query_as(
+        "SELECT * FROM contract_versions WHERE contract_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(contract_uuid)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get contract versions", err))?;
+
+    Ok(Json(versions))
+}
+
+/// Publish a new contract
+pub async fn publish_contract(
+    State(state): State<AppState>,
+    payload: Result<Json<PublishRequest>, JsonRejection>,
+) -> ApiResult<Json<Contract>> {
+    let Json(req) = payload.map_err(map_json_rejection)?;
+
+    // First, ensure publisher exists or create one
+    let publisher: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address) VALUES ($1)
+         ON CONFLICT (stellar_address) DO UPDATE SET stellar_address = EXCLUDED.stellar_address
+         RETURNING *",
+    )
+    .bind(&req.publisher_address)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("upsert publisher", err))?;
+
+    // TODO: Fetch WASM hash from Stellar network
+    let wasm_hash = "placeholder_hash".to_string();
+
+    // Insert contract
+    let contract: Contract = sqlx::query_as(
+        "INSERT INTO contracts (contract_id, wasm_hash, name, description, publisher_id, network, category, tags)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *",
+    )
+    .bind(&req.contract_id)
+    .bind(&wasm_hash)
+    .bind(&req.name)
+    .bind(&req.description)
+    .bind(publisher.id)
+    .bind(&req.network)
+    .bind(&req.category)
+    .bind(&req.tags)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create contract", err))?;
+
+    Ok(Json(contract))
+}
+
+/// Verify a contract
+pub async fn verify_contract(
+    State(_state): State<AppState>,
+    payload: Result<Json<VerifyRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(_req) = payload.map_err(map_json_rejection)?;
+
+    // TODO: Implement verification logic
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "message": "Verification started"
+    })))
+}
+
+/// Create a publisher
+pub async fn create_publisher(
+    State(state): State<AppState>,
+    payload: Result<Json<Publisher>, JsonRejection>,
+) -> ApiResult<Json<Publisher>> {
+    let Json(publisher) = payload.map_err(map_json_rejection)?;
+
+    let created: Publisher = sqlx::query_as(
+        "INSERT INTO publishers (stellar_address, username, email, github_url, website)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *",
+    )
+    .bind(&publisher.stellar_address)
+    .bind(&publisher.username)
+    .bind(&publisher.email)
+    .bind(&publisher.github_url)
+    .bind(&publisher.website)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| db_internal_error("create publisher", err))?;
+
+    Ok(Json(created))
+}
+
+/// Get publisher by ID
+pub async fn get_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Publisher>> {
+    let publisher_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidPublisherId",
+            format!("Invalid publisher ID format: {}", id),
+        )
+    })?;
+
+    let publisher: Publisher = sqlx::query_as("SELECT * FROM publishers WHERE id = $1")
+        .bind(publisher_uuid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "PublisherNotFound",
+                format!("No publisher found with ID: {}", id),
+            ),
+            _ => db_internal_error("get publisher by id", err),
+        })?;
+
+    Ok(Json(publisher))
+}
+
+/// Get all contracts by a publisher
+pub async fn get_publisher_contracts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<Contract>>> {
+    let publisher_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidPublisherId",
+            format!("Invalid publisher ID format: {}", id),
+        )
+    })?;
+
+    let contracts: Vec<Contract> = sqlx::query_as(
+        "SELECT * FROM contracts WHERE publisher_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(publisher_uuid)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get publisher contracts", err))?;
+
+    Ok(Json(contracts))
+}
+
+
+/// Get contract health
+pub async fn get_contract_health(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ContractHealth>> {
+    let contract_uuid = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request(
+            "InvalidContractId",
+            format!("Invalid contract ID format: {}", id),
+        )
+    })?;
+
+    // Check if contract exists first
+    let _contract: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+        .bind(contract_uuid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|match_err| match match_err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "ContractNotFound",
+                format!("No contract found with ID: {}", id),
+            ),
+            _ => db_internal_error("check contract existence", match_err),
+        })?;
+
+    let health: ContractHealth = sqlx::query_as("SELECT * FROM contract_health WHERE contract_id = $1")
+        .bind(contract_uuid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::not_found(
+                "HealthNotFound",
+                format!("Health data not found for contract: {}", id),
+            ),
+            _ => db_internal_error("get contract health", err),
+        })?;
+
+    Ok(Json(health))
+}
+
+/// Fallback endpoint for unknown routes
+pub async fn route_not_found() -> ApiError {
+    ApiError::not_found("RouteNotFound", "The requested endpoint does not exist")
 }
