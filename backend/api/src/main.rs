@@ -9,6 +9,9 @@ mod handlers;
 mod routes;
 mod scoring;
 mod state;
+mod quality_calculator;   
+mod quality_handlers;    
+mod quality_routes;      
 
 use anyhow::Result;
 use axum::Router;
@@ -59,6 +62,7 @@ async fn main() -> Result<()> {
         .merge(routes::health_routes())
         .merge(audit_routes::security_audit_routes())
         .merge(benchmark_routes::benchmark_routes())
+        .merge(quality_routes::quality_routes()) 
         .layer(CorsLayer::permissive())
         .with_state(state);
 

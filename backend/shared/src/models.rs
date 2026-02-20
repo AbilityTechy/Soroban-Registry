@@ -125,7 +125,7 @@ pub struct ContractSearchParams {
     pub page_size: Option<i64>,
 }
 
-// Add to shared/src/lib.rs after ContractSearchParams
+
 
 /// Pagination params for contract versions (limit/offset style)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +302,271 @@ pub struct BenchmarkTrendPoint {
     pub avg_ms: f64,
     pub min_ms: f64,
     pub max_ms: f64,
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUALITY SCORE TYPES  — append to shared/src/lib.rs
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────
+// Raw metric types
+// ─────────────────────────────────────────────────────────
+
+/// Low-level source code metrics computed from raw source
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, Default)]
+pub struct CodeMetrics {
+    pub lines_of_code: i64,
+    pub blank_lines: i64,
+    pub comment_lines: i64,
+    pub cyclomatic_complexity: f64, // avg across all functions
+    pub max_function_complexity: i64, // worst single function
+    pub function_count: i64,
+    pub avg_function_length: f64, // lines per function
+    pub deeply_nested_count: i64, // blocks nested > 3 levels
+}
+
+/// Test quality metrics
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, Default)]
+pub struct TestMetrics {
+    pub test_count: i64,
+    pub test_lines: i64,
+    /// 0.0 – 1.0 (fraction of functions covered by at least one test)
+    pub line_coverage: f64,
+    pub function_coverage: f64,
+    pub branch_coverage: f64,
+    /// test lines / source lines
+    pub test_to_code_ratio: f64,
+    pub has_integration_tests: bool,
+    pub has_property_tests: bool,
+}
+
+/// Documentation quality metrics
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, Default)]
+pub struct DocMetrics {
+    /// Fraction of pub functions with a doc comment
+    pub public_fn_doc_coverage: f64,
+    /// Fraction of pub structs/enums with a doc comment
+    pub type_doc_coverage: f64,
+    pub has_readme: bool,
+    pub has_changelog: bool,
+    pub has_license: bool,
+    pub example_count: i64,
+}
+
+/// Security-specific quality metrics (derived from AuditRecord)
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, Default)]
+pub struct SecurityMetrics {
+    /// Overall audit score from AuditRecord (0–100)
+    pub audit_score: f64,
+    pub critical_findings: i64,
+    pub high_findings: i64,
+    pub medium_findings: i64,
+    pub low_findings: i64,
+    pub is_verified: bool,
+    pub has_formal_audit: bool,
+}
+
+// ─────────────────────────────────────────────────────────
+// Aggregate score + weights
+// ─────────────────────────────────────────────────────────
+
+/// Weights used when combining sub-scores into overall quality
+/// All must sum to 1.0
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityWeights {
+    pub code: f64,       // default 0.25
+    pub tests: f64,      // default 0.30
+    pub docs: f64,       // default 0.20
+    pub security: f64,   // default 0.25
+}
+
+impl Default for QualityWeights {
+    fn default() -> Self {
+        Self { code: 0.25, tests: 0.30, docs: 0.20, security: 0.25 }
+    }
+}
+
+impl QualityWeights {
+    pub fn is_valid(&self) -> bool {
+        let sum = self.code + self.tests + self.docs + self.security;
+        (sum - 1.0).abs() < 1e-6
+    }
+}
+
+/// Per-dimension score breakdown (each 0–100)
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct QualityScoreBreakdown {
+    pub code_score: f64,
+    pub test_score: f64,
+    pub doc_score: f64,
+    pub security_score: f64,
+    pub overall_score: f64,
+}
+
+/// Quality badge derived from overall score
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum QualityBadge {
+    Excellent,  // 90–100
+    Good,       // 75–89
+    Fair,       // 50–74
+    Poor,       // 25–49
+    Critical,   // 0–24
+}
+
+impl QualityBadge {
+    pub fn from_score(score: f64) -> Self {
+        match score as u32 {
+            90..=100 => QualityBadge::Excellent,
+            75..=89  => QualityBadge::Good,
+            50..=74  => QualityBadge::Fair,
+            25..=49  => QualityBadge::Poor,
+            _        => QualityBadge::Critical,
+        }
+    }
+}
+
+impl std::fmt::Display for QualityBadge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Database row — one quality snapshot per contract version
+// ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct QualityRecord {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub contract_version: String,
+    // raw metrics stored as JSONB
+    pub code_metrics: serde_json::Value,
+    pub test_metrics: serde_json::Value,
+    pub doc_metrics: serde_json::Value,
+    pub security_metrics: serde_json::Value,
+    // aggregate scores
+    pub code_score: f64,
+    pub test_score: f64,
+    pub doc_score: f64,
+    pub security_score: f64,
+    pub overall_score: f64,
+    pub badge: String,
+    pub computed_at: DateTime<Utc>,
+}
+
+// ─────────────────────────────────────────────────────────
+// Trend / history
+// ─────────────────────────────────────────────────────────
+
+/// One point in a quality trend chart
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct QualityTrendPoint {
+    pub quality_id: Uuid,
+    pub contract_version: String,
+    pub computed_at: DateTime<Utc>,
+    pub overall_score: f64,
+    pub code_score: f64,
+    pub test_score: f64,
+    pub doc_score: f64,
+    pub security_score: f64,
+    pub badge: String,
+}
+
+// ─────────────────────────────────────────────────────────
+// Benchmarking — comparison to similar contracts
+// ─────────────────────────────────────────────────────────
+
+/// How this contract's quality compares to its category peers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryBenchmark {
+    pub category: String,
+    pub peer_count: i64,
+    pub category_avg_score: f64,
+    pub category_p25_score: f64,
+    pub category_p75_score: f64,
+    pub category_p95_score: f64,
+    pub this_contract_score: f64,
+    /// percentile rank within the category (0–100)
+    pub percentile_rank: f64,
+    pub above_average: bool,
+}
+
+// ─────────────────────────────────────────────────────────
+// Quality threshold / target
+// ─────────────────────────────────────────────────────────
+
+/// A quality gate — minimum scores that must be met
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct QualityThreshold {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub min_overall_score: f64,
+    pub min_code_score: f64,
+    pub min_test_score: f64,
+    pub min_doc_score: f64,
+    pub min_security_score: f64,
+    pub fail_on_critical_finding: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Result of checking a score against a threshold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdCheckResult {
+    pub passed: bool,
+    pub violations: Vec<ThresholdViolation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdViolation {
+    pub dimension: String,
+    pub required: f64,
+    pub actual: f64,
+    pub gap: f64,
+}
+
+// ─────────────────────────────────────────────────────────
+// API request / response shapes
+// ─────────────────────────────────────────────────────────
+
+/// POST /contracts/:id/quality  (trigger a fresh calculation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeQualityRequest {
+    pub source_code: String,
+    pub version: String,
+    pub test_output: Option<String>,    // cargo test output with coverage
+    pub audit_id: Option<Uuid>,         // link existing audit result
+    pub weights: Option<QualityWeights>,
+}
+
+/// Full response for GET /contracts/:id/quality
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityResponse {
+    pub record: QualityRecord,
+    pub breakdown: QualityScoreBreakdown,
+    pub code_metrics: CodeMetrics,
+    pub test_metrics: TestMetrics,
+    pub doc_metrics: DocMetrics,
+    pub security_metrics: SecurityMetrics,
+    pub badge: QualityBadge,
+    pub threshold_result: Option<ThresholdCheckResult>,
+    pub benchmark: Option<CategoryBenchmark>,
+}
+
+/// POST /contracts/:id/quality/threshold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetThresholdRequest {
+    pub min_overall_score: f64,
+    pub min_code_score: f64,
+    pub min_test_score: f64,
+    pub min_doc_score: f64,
+    pub min_security_score: f64,
+    #[serde(default)]
+    pub fail_on_critical_finding: bool,
+    pub created_by: String,
 }
 // ═══════════════════════════════════════════════════════════════════════════
 // SECURITY AUDIT TYPES
