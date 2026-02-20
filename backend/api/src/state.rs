@@ -1,3 +1,4 @@
+use crate::auth::AuthManager;
 use crate::cache::{CacheConfig, CacheLayer};
 use crate::resource_tracking::ResourceManager;
 use prometheus::Registry;
@@ -14,6 +15,7 @@ pub struct AppState {
     pub cache: Arc<CacheLayer>,
     pub registry: Registry,
     pub resource_mgr: Arc<RwLock<ResourceManager>>,
+    pub auth_mgr: Arc<RwLock<AuthManager>>,
 }
 
 impl AppState {
@@ -25,6 +27,7 @@ impl AppState {
             cache: Arc::new(CacheLayer::new(config)),
             registry,
             resource_mgr: Arc::new(RwLock::new(ResourceManager::new())),
+            auth_mgr: Arc::new(RwLock::new(AuthManager::from_env())),
         }
     }
 }

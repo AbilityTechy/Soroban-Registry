@@ -1,5 +1,8 @@
 mod aggregation;
 mod analytics;
+mod auth;
+mod auth_handlers;
+mod auth_middleware;
 mod cache;
 mod error;
 mod handlers;
@@ -50,6 +53,10 @@ async fn main() -> Result<()> {
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
+        .merge(routes::auth_routes())
+        .merge(
+            routes::protected_routes().layer(middleware::from_fn(auth_middleware::auth_middleware)),
+        )
         .merge(routes::contract_routes())
         .merge(routes::publisher_routes())
         .merge(routes::health_routes())

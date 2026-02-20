@@ -1,9 +1,9 @@
 use axum::{
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Router,
 };
 
-use crate::{handlers, metrics_handler, resource_handlers, state::AppState};
+use crate::{auth_handlers, handlers, metrics_handler, resource_handlers, state::AppState};
 
 pub fn observability_routes() -> Router<AppState> {
     Router::new().route("/metrics", get(metrics_handler::metrics_endpoint))
@@ -12,14 +12,12 @@ pub fn observability_routes() -> Router<AppState> {
 pub fn contract_routes() -> Router<AppState> {
     Router::new()
         .route("/api/contracts", get(handlers::list_contracts))
-        .route("/api/contracts", post(handlers::publish_contract))
         .route("/api/contracts/:id", get(handlers::get_contract))
         .route("/api/contracts/:id/abi", get(handlers::get_contract_abi))
         .route(
             "/api/contracts/:id/versions",
             get(handlers::get_contract_versions),
         )
-        .route("/api/contracts/verify", post(handlers::verify_contract))
         .route(
             "/api/contracts/:id/state/:key",
             get(handlers::get_contract_state).post(handlers::update_contract_state),
@@ -60,6 +58,30 @@ pub fn migration_routes() -> Router<AppState> {
 
 pub fn canary_routes() -> Router<AppState> {
     Router::new()
+}
+
+pub fn auth_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/auth/challenge", get(auth_handlers::get_challenge))
+        .route("/api/auth/verify", post(auth_handlers::verify_challenge))
+}
+
+pub fn protected_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/contracts", post(handlers::publish_contract))
+        .route(
+            "/api/contracts/:id/verify",
+            post(handlers::verify_contract_by_id),
+        )
+        .route("/api/contracts/verify", post(handlers::verify_contract))
+        .route(
+            "/publishers/:address",
+            patch(handlers::patch_publisher_by_address),
+        )
+        .route(
+            "/api/publishers/:address",
+            patch(handlers::patch_publisher_by_address),
+        )
 }
 
 pub fn ab_test_routes() -> Router<AppState> {
