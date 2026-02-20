@@ -6,6 +6,7 @@ mod manifest;
 mod multisig;
 mod patch;
 mod profiler;
+mod sla;
 mod test_framework;
 mod wizard;
 
@@ -220,6 +221,32 @@ pub enum Commands {
         verbose: bool,
     },
 
+    /// SLA compliance monitoring
+    Sla {
+        #[command(subcommand)]
+        action: SlaCommands,
+    },
+}
+
+/// Sub-commands for the `sla` group
+#[derive(Debug, Subcommand)]
+pub enum SlaCommands {
+    /// Record hourly SLA metrics for a contract
+    Record {
+        /// Contract identifier
+        id: String,
+        /// Uptime percentage (0-100)
+        uptime: f64,
+        /// Average latency in milliseconds
+        latency: f64,
+        /// Error rate percentage (0-100)
+        error_rate: f64,
+    },
+    /// Show real-time SLA compliance dashboard
+    Status {
+        /// Contract identifier
+        id: String,
+    },
 	     /// Show the trust score and breakdown for a contract
     TrustScore {
         /// Contract UUID to score
@@ -505,6 +532,14 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::Sla { action } => match action {
+            SlaCommands::Record { id, uptime, latency, error_rate } => {
+                log::debug!("Command: sla record | id={} uptime={} latency={} error_rate={}", id, uptime, latency, error_rate);
+                commands::sla_record(&id, uptime, latency, error_rate)?;
+            }
+            SlaCommands::Status { id } => {
+                log::debug!("Command: sla status | id={}", id);
+                commands::sla_status(&id)?;
         Commands::Deps { command } => match command {
             DepsCommands::List { contract_id } => {
                 commands::deps_list(&cli.api_url, &contract_id).await?;

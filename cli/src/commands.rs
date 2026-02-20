@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::patch::{PatchManager, Severity};
 use crate::profiler;
+use crate::sla::SlaManager;
 use crate::test_framework;
 
 pub async fn search(
@@ -935,7 +936,7 @@ pub async fn run_tests(
     }
 
     if let Some(junit_path) = junit_output {
-        test_framework::generate_junit_xml(&[result], Path::new(junit_path))?;
+        test_framework::generate_junit_xml(&[result.clone()], Path::new(junit_path))?;
         println!("\n{} JUnit XML report exported to: {}", "✓".green(), junit_path);
     }
 
