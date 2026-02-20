@@ -5,6 +5,7 @@ mod import;
 mod manifest;
 mod multisig;
 mod patch;
+mod profiler;
 mod wizard;
 
 use anyhow::Result;
@@ -160,6 +161,32 @@ pub enum Commands {
     Multisig {
         #[command(subcommand)]
         action: MultisigCommands,
+    },
+
+    /// Profile contract execution performance
+    Profile {
+        /// Path to contract file
+        contract_path: String,
+
+        /// Method to profile
+        #[arg(long)]
+        method: Option<String>,
+
+        /// Output JSON file
+        #[arg(long)]
+        output: Option<String>,
+
+        /// Generate flame graph
+        #[arg(long)]
+        flamegraph: Option<String>,
+
+        /// Compare with baseline profile
+        #[arg(long)]
+        compare: Option<String>,
+
+        /// Show recommendations
+        #[arg(long, default_value = "true")]
+        recommendations: bool,
     },
 }
 
@@ -459,6 +486,24 @@ async fn main() -> Result<()> {
                 multisig::list_proposals(&cli.api_url, status.as_deref(), limit).await?;
             }
         },
+        Commands::Profile {
+            contract_path,
+            method,
+            output,
+            flamegraph,
+            compare,
+            recommendations,
+        } => {
+            commands::profile(
+                &contract_path,
+                method.as_deref(),
+                output.as_deref(),
+                flamegraph.as_deref(),
+                compare.as_deref(),
+                recommendations,
+            )
+            .await?;
+        }
     }
 
     Ok(())

@@ -4,8 +4,10 @@ use colored::Colorize;
 use serde_json::json;
 use shared::{extract_abi, generate_markdown};
 use std::fs;
+use std::path::Path;
 
 use crate::patch::{PatchManager, Severity};
+use crate::profiler;
 
 pub async fn search(
     api_url: &str,
@@ -106,7 +108,7 @@ pub async fn info(api_url: &str, contract_id: &str, network: Network) -> Result<
         "Network".bold(),
         contract["network"].as_str().unwrap_or("").bright_blue()
     );
-
+    
     let is_verified = contract["is_verified"].as_bool().unwrap_or(false);
     println!(
         "{}: {}",
@@ -620,5 +622,93 @@ pub fn doc(contract_path: &str, output_dir: &str) -> Result<()> {
         .with_context(|| format!("Failed to write documentation to {:?}", out_path))?;
 
     println!("{} Documentation generated at {:?}", "✓".green(), out_path);
+    Ok(())
+}
+
+pub async fn profile(
+    contract_path: &str,
+    method: Option<&str>,
+    output: Option<&str>,
+    flamegraph: Option<&str>,
+    compare: Option<&str>,
+    show_recommendations: bool,
+) -> Result<()> {
+    let path = Path::new(contract_path);
+    if !path.exists() {
+        anyhow::bail!("Contract file not found: {}", contract_path);
+    }
+
+    println!("\n{}", "Profiling contract...".bold().cyan());
+    println!("{}", "=".repeat(80).cyan());
+
+    let mut profiler = profiler::Profiler::new();
+    profiler::simulate_execution(path, method, &mut profiler)?;
+    let profile_data = profiler.finish(contract_path.to_string(), method.map(|s| s.to_string()));
+
+    println!("\n{}", "Profile Results:".bold().green());
+    println!("Total Duration: {:.2}ms", profile_data.total_duration.as_secs_f64() * 1000.0);
+    println!("Overhead: {:.2}%", profile_data.overhead_percent);
+    println!("Functions Profiled: {}", profile_data.functions.len());
+
+    let mut sorted_functions: Vec<_> = profile_data.functions.values().collect();
+    sorted_functions.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+
+    println!("\n{}", "Top Functions:".bold());
+    for (i, func) in sorted_functions.iter().take(10).enumerate() {
+        println!(
+            "{}. {} - {:.2}ms ({} calls, avg: {:.2}μs)",
+            i + 1,
+            func.name.bold(),
+            func.total_time.as_secs_f64() * 1000.0,
+            func.call_count,
+            func.avg_time.as_secs_f64() * 1_000_000.0
+        );
+    }
+
+    if let Some(output_path) = output {
+        let json = serde_json::to_string_pretty(&profile_data)?;
+        std::fs::write(output_path, json)
+            .with_context(|| format!("Failed to write profile to: {}", output_path))?;
+        println!("\n{} Profile exported to: {}", "✓".green(), output_path);
+    }
+
+    if let Some(flame_path) = flamegraph {
+        profiler::generate_flame_graph(&profile_data, Path::new(flame_path))?;
+        println!("{} Flame graph generated: {}", "✓".green(), flame_path);
+    }
+
+    if let Some(baseline_path) = compare {
+        let baseline_json = std::fs::read_to_string(baseline_path)
+            .with_context(|| format!("Failed to read baseline: {}", baseline_path))?;
+        let baseline: profiler::ProfileData = serde_json::from_str(&baseline_json)?;
+
+        let comparisons = profiler::compare_profiles(&baseline, &profile_data);
+
+        println!("\n{}", "Comparison Results:".bold().yellow());
+        for comp in comparisons.iter().take(10) {
+            let sign = if comp.time_diff_ns > 0 { "+" } else { "" };
+            println!(
+                "{}: {} ({}{:.2}%, {:.2}ms → {:.2}ms)",
+                comp.function.bold(),
+                comp.status,
+                sign,
+                comp.time_diff_percent,
+                comp.baseline_time.as_secs_f64() * 1000.0,
+                comp.current_time.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    if show_recommendations {
+        let recommendations = profiler::generate_recommendations(&profile_data);
+        println!("\n{}", "Recommendations:".bold().magenta());
+        for (i, rec) in recommendations.iter().enumerate() {
+            println!("{}. {}", i + 1, rec);
+        }
+    }
+
+    println!("\n{}", "=".repeat(80).cyan());
+    println!();
+
     Ok(())
 }
