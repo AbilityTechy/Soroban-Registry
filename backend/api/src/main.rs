@@ -21,6 +21,7 @@ mod rate_limit;
 mod routes;
 mod state;
 mod health_monitor;
+mod migration_cli;
 
 use anyhow::Result;
 use axum::http::{header, HeaderValue, Method};
@@ -48,6 +49,9 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let migration_command = migration_cli::parse_command(&args)?;
+
     // Database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -56,7 +60,12 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await?;
 
-    // Run migrations
+    // Run migrations by default, or execute migration subcommands.
+    if let Some(command) = migration_command {
+        migration_cli::execute(command, &pool).await?;
+        return Ok(());
+    }
+
     sqlx::migrate!("../../database/migrations")
         .run(&pool)
         .await?;
@@ -84,55 +93,3 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(routes::contract_routes())
         .merge(routes::publisher_routes())
-        .merge(routes::health_routes())
-        .merge(routes::migration_routes())
-        .merge(routes::canary_routes())
-        .merge(routes::ab_test_routes())
-        .merge(routes::performance_routes())
-        .merge(multisig_routes::multisig_routes())
-        .merge(audit_routes::audit_routes())
-        .merge(benchmark_routes::benchmark_routes())
-        .fallback(handlers::route_not_found)
-        .layer(middleware::from_fn(request_logger))
-        .layer(middleware::from_fn_with_state(
-            rate_limit_state,
-            rate_limit::rate_limit_middleware,
-        ))
-        .layer(CorsLayer::permissive())
-        .layer(cors)
-        .with_state(state.clone());
-
-    // Spawn health monitor task
-    tokio::spawn(health_monitor::run_health_monitor(state));
-
-    // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
-    tracing::info!("API server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn request_logger(
-    req: axum::http::Request<axum::body::Body>,
-    next: middleware::Next,
-) -> axum::response::Response {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let start = std::time::Instant::now();
-
-    let response = next.run(req).await;
-
-    let elapsed = start.elapsed().as_millis();
-    let status = response.status().as_u16();
-
-    tracing::info!("{method} {uri} {status} {elapsed}ms");
-
-    response
-}
