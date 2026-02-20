@@ -6,6 +6,7 @@ mod manifest;
 mod multisig;
 mod patch;
 mod profiler;
+mod sla;
 mod test_framework;
 mod wizard;
 
@@ -68,7 +69,11 @@ pub enum Commands {
         #[arg(long)]
         description: Option<String>,
 
-        /// Contract category (e.g. token, defi, nft)
+        /// Network (mainnet, testnet, futurenet)
+        #[arg(long, default_value = "Testnet")]
+        network: String,
+
+        /// Category
         #[arg(long)]
         category: Option<String>,
 
@@ -134,40 +139,9 @@ pub enum Commands {
 
     /// Generate documentation from a contract WASM
     Doc {
-        /// Path to contract WASM file
         contract_path: String,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Search for contracts
-    Search { query: String, #[arg(long)] verified_only: bool },
-    /// Get contract details
-    Info { contract_id: String },
-    /// Publish a contract
-    Publish {
-        contract_id: String,
-        name: String,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long)]
-        category: Option<String>,
-        #[arg(long)]
-        tags: Option<String>,
-        #[arg(long)]
-        publisher: String,
-    },
-    /// List recent contracts
-    List { #[arg(long, default_value_t = 10)] limit: usize },
-    /// Migrate a contract
-    Migrate {
-        contract_id: String,
-        wasm: String,
-        #[arg(long)] simulate_fail: bool,
-        #[arg(long)] dry_run: bool,
+        #[arg(long, default_value = "docs")]
+        output: String,
     },
 
     /// Launch the interactive setup wizard
@@ -243,6 +217,39 @@ enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
+
+    /// SLA compliance monitoring
+    Sla {
+        #[command(subcommand)]
+        action: SlaCommands,
+    },
+}
+
+/// Sub-commands for the `sla` group
+#[derive(Debug, Subcommand)]
+pub enum SlaCommands {
+    /// Record hourly SLA metrics for a contract
+    Record {
+        /// Contract identifier
+        id: String,
+        /// Uptime percentage (0-100)
+        uptime: f64,
+        /// Average latency in milliseconds
+        latency: f64,
+        /// Error rate percentage (0-100)
+        error_rate: f64,
+    },
+    /// Show real-time SLA compliance dashboard
+    Status {
+        /// Contract identifier
+        id: String,
+    },
+	     /// Show the trust score and breakdown for a contract
+    TrustScore {
+        /// Contract UUID to score
+        contract_id: String,
+    },
+
 }
 
 /// Sub-commands for the `multisig` group
@@ -318,6 +325,10 @@ pub enum PatchCommands {
         #[arg(long, default_value = "100")]
         rollout: u8,
     },
+    Notify {
+        #[arg(long)]
+        patch_id: String,
+    },
     /// Notify subscribers about a patch
     Notify { patch_id: String },
     /// Apply a patch to a specific contract
@@ -326,6 +337,21 @@ pub enum PatchCommands {
         contract_id: String,
         #[arg(long)]
         patch_id: String,
+    },
+
+    /// Manage contract dependencies
+    Deps {
+        #[command(subcommand)]
+        command: DepsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepsCommands {
+    /// List dependencies for a contract
+    List {
+        /// Contract ID
+        contract_id: String,
     },
 }
 
@@ -421,6 +447,13 @@ async fn main() -> Result<()> {
                 commands::patch_apply(&cli.api_url, &contract_id, &patch_id).await?;
             }
         },
+
+		  Commands::TrustScore { contract_id } => {
+            log::debug!("Command: trust-score | contract_id={}", contract_id);
+            commands::trust_score(&cli.api_url, &contract_id, network).await?;
+        },
+
+        // ── Multi-sig commands (issue #47) ───────────────────────────────────
         Commands::Multisig { action } => match action {
             MultisigCommands::CreatePolicy { name, threshold, signers, expiry_secs, created_by } => {
                 let signer_vec: Vec<String> =
@@ -500,6 +533,19 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::Sla { action } => match action {
+            SlaCommands::Record { id, uptime, latency, error_rate } => {
+                log::debug!("Command: sla record | id={} uptime={} latency={} error_rate={}", id, uptime, latency, error_rate);
+                commands::sla_record(&id, uptime, latency, error_rate)?;
+            }
+            SlaCommands::Status { id } => {
+                log::debug!("Command: sla status | id={}", id);
+                commands::sla_status(&id)?;
+        Commands::Deps { command } => match command {
+            DepsCommands::List { contract_id } => {
+                commands::deps_list(&cli.api_url, &contract_id).await?;
+            }
+        },
     }
 
     Ok(())
