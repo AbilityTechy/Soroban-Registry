@@ -28,6 +28,7 @@ pub struct Contract {
 /// Network where the contract is deployed
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "network_type", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
     Testnet,
@@ -90,6 +91,43 @@ pub struct ContractStats {
     pub total_interactions: i64,
     pub unique_users: i64,
     pub last_interaction: Option<DateTime<Utc>>,
+}
+
+/// Contract dependency relationship
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ContractDependency {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub depends_on_id: Uuid,
+    pub dependency_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Graph node (minimal contract info for graph rendering)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: Uuid,
+    pub contract_id: String,
+    pub name: String,
+    pub network: Network,
+    pub is_verified: bool,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Graph edge (dependency relationship)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: Uuid,
+    pub target: Uuid,
+    pub dependency_type: String,
+}
+
+/// Full graph response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphResponse {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
 }
 
 /// Request to publish a new contract
@@ -839,4 +877,91 @@ pub struct AuditLogPage {
     pub total:       i64,
     pub page:        i64,
     pub total_pages: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA RESIDENCY CONTROLS  (issue #100)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "residency_decision", rename_all = "lowercase")]
+pub enum ResidencyDecision {
+    Allowed,
+    Denied,
+}
+
+impl std::fmt::Display for ResidencyDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allowed => write!(f, "allowed"),
+            Self::Denied  => write!(f, "denied"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ResidencyPolicy {
+    pub id:              Uuid,
+    pub contract_id:     String,
+    pub allowed_regions: Vec<String>,
+    pub description:     Option<String>,
+    pub is_active:       bool,
+    pub created_by:      String,
+    pub created_at:      DateTime<Utc>,
+    pub updated_at:      DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ResidencyAuditLog {
+    pub id:               Uuid,
+    pub policy_id:        Uuid,
+    pub contract_id:      String,
+    pub requested_region: String,
+    pub decision:         ResidencyDecision,
+    pub action:           String,
+    pub requested_by:     Option<String>,
+    pub reason:           Option<String>,
+    pub created_at:       DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ResidencyViolation {
+    pub id:               Uuid,
+    pub policy_id:        Uuid,
+    pub contract_id:      String,
+    pub attempted_region: String,
+    pub action:           String,
+    pub attempted_by:     Option<String>,
+    pub prevented_at:     DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateResidencyPolicyRequest {
+    pub contract_id:     String,
+    pub allowed_regions: Vec<String>,
+    pub description:     Option<String>,
+    pub created_by:      String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateResidencyPolicyRequest {
+    pub allowed_regions: Option<Vec<String>>,
+    pub description:     Option<String>,
+    pub is_active:       Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckResidencyRequest {
+    pub policy_id:        Uuid,
+    pub contract_id:      String,
+    pub requested_region: String,
+    pub action:           String,
+    pub requested_by:     Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListResidencyLogsParams {
+    pub contract_id: Option<String>,
+    pub limit:       Option<i64>,
+    pub page:        Option<i64>,
 }

@@ -21,9 +21,13 @@ mod multisig_routes;
 mod observability;
 mod popularity;
 mod rate_limit;
+mod residency_handlers;
+mod residency_routes;
 mod routes;
 mod state;
+mod trust;
 mod health_monitor;
+mod migration_cli;
 
 use anyhow::Result;
 use axum::http::{header, HeaderValue, Method};
@@ -44,6 +48,9 @@ async fn main() -> Result<()> {
 
     let obs = Observability::init()?;
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let migration_command = migration_cli::parse_command(&args)?;
+
     // Database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -52,7 +59,12 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await?;
 
-    // Run migrations
+    // Run migrations by default, or execute migration subcommands.
+    if let Some(command) = migration_command {
+        migration_cli::execute(command, &pool).await?;
+        return Ok(());
+    }
+
     sqlx::migrate!("../../database/migrations")
         .run(&pool)
         .await?;
@@ -89,6 +101,7 @@ async fn main() -> Result<()> {
         .merge(audit_routes::audit_routes())
         .merge(benchmark_routes::benchmark_routes())
         .merge(routes::observability_routes())
+        .merge(residency_routes::residency_routes())
         .fallback(handlers::route_not_found)
         .layer(middleware::from_fn(request_logger))
         .layer(middleware::from_fn_with_state(
@@ -97,10 +110,7 @@ async fn main() -> Result<()> {
         ))
         .layer(CorsLayer::permissive())
         .layer(cors)
-        .with_state(state.clone());
-
-    // Spawn health monitor task
-    tokio::spawn(health_monitor::run_health_monitor(state));
+        .with_state(state);
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
@@ -133,3 +143,4 @@ async fn request_logger(
 
     response
 }
+        .merge(routes::publisher_routes())
