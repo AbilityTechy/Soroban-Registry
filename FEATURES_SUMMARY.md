@@ -43,9 +43,10 @@
 003_security_patches.sql         - Security enhancements
 004_maintenance_mode.sql         - ✅ Maintenance windows
 005_maturity_levels.sql          - ✅ Maturity levels
+006_cost_estimation.sql          - ✅ Cost estimation
 ```
 
-**Total**: 10 migrations
+**Total**: 11 migrations
 
 ## API Endpoints
 
@@ -63,6 +64,30 @@ PUT    /api/contracts/:id/maturity              - Update level
 GET    /api/contracts/:id/maturity/history      - Get history
 GET    /api/contracts/:id/maturity/requirements - Check criteria
 GET    /api/contracts?maturity=stable           - Filter by level
+```
+
+### Cost Estimation
+```
+POST   /api/contracts/:id/cost-estimate          - Single estimate
+POST   /api/contracts/:id/cost-estimate/batch    - Batch estimate
+POST   /api/contracts/:id/cost-estimate/optimize - Optimization suggestions
+POST   /api/contracts/:id/cost-estimate/forecast - Cost projections
+```
+
+## CLI Commands
+
+### Cost Estimation
+```bash
+# Basic estimate
+soroban-registry costs <contract-id> --method=transfer
+
+# With optimization suggestions
+soroban-registry costs <contract-id> --method=transfer \
+  --invocations=100 --optimize
+
+# With cost forecast
+soroban-registry costs <contract-id> --method=transfer \
+  --invocations=1000 --storage-kb=10 --forecast
 ```
 
 ## Frontend Components
@@ -177,20 +202,22 @@ curl http://localhost:3001/api/contracts?maturity=stable
 
 ## Statistics
 
-- **Backend Files Created**: 12
+- **Backend Files Created**: 16
 - **Frontend Files Created**: 6
-- **Database Migrations**: 2 new (10 total)
-- **API Endpoints**: 8 new
-- **Documentation Pages**: 7
+- **CLI Files Created**: 3
+- **Database Migrations**: 3 new (11 total)
+- **API Endpoints**: 12 new
+- **Documentation Pages**: 9
 - **CI/CD Jobs**: 5
-- **Lines of Code**: ~2,000
+- **Lines of Code**: ~3,500
 
 ## Status Summary
 
 ✅ **Maintenance Mode**: Complete, tested, production-ready
 ✅ **Maturity Levels**: Complete, tested, production-ready
+✅ **Cost Estimation**: Complete, tested, production-ready
 ✅ **CI/CD Pipeline**: Configured and passing
 ✅ **Documentation**: Comprehensive
 ✅ **Deployment**: Ready
 
-Both features are fully implemented, tested, and ready for production deployment.
+All three features are fully implemented, tested, and ready for production deployment.
