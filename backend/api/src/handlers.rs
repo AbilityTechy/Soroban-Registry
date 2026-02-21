@@ -3,6 +3,7 @@ pub mod migrations;
 use axum::{
     extract::{
         rejection::{JsonRejection, QueryRejection},
+        Extension, Path, Query, State,
         Path, Query, State,
     },
     http::StatusCode,
@@ -18,6 +19,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
+    auth_middleware::AuthContext,
     error::{ApiError, ApiResult},
     resource_tracking::ResourceUsage,
 use shared::{
@@ -153,6 +155,16 @@ pub async fn list_contracts(
         Ok(rows) => rows,
         Err(err) => return db_internal_error("list contracts", err).into_response(),
     };
+    let contracts: Vec<Contract> =
+        match sqlx::query_as("SELECT * FROM contracts ORDER BY created_at DESC LIMIT $1 OFFSET $2")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&state.db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => return db_internal_error("list contracts", err).into_response(),
+        };
     let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
         .fetch_one(&state.db)
         .await
@@ -161,6 +173,11 @@ pub async fn list_contracts(
         Err(err) => return db_internal_error("count contracts", err).into_response(),
     };
     (StatusCode::OK, Json(PaginatedResponse::new(contracts, total, page, limit))).into_response()
+    (
+        StatusCode::OK,
+        Json(PaginatedResponse::new(contracts, total, page, limit)),
+    )
+        .into_response()
 
     let page = params.page.unwrap_or(1);
     let limit = params.limit.unwrap_or(20);
@@ -405,6 +422,22 @@ pub async fn verify_contract(
     payload: Result<Json<VerifyRequest>, JsonRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let Json(_req) = payload.map_err(map_json_rejection)?;
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "message": "Verification started"
+    })))
+}
+
+pub async fn verify_contract_by_id(
+    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    payload: Result<Json<VerifyRequest>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Json(mut req) = payload.map_err(map_json_rejection)?;
+    req.contract_id = id;
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "contract_id": req.contract_id,
 
     // Fire-and-forget analytics event
     let pool = state.db.clone();
@@ -538,6 +571,54 @@ pub async fn get_publisher_contracts(
             .await
             .map_err(|err| db_internal_error("list publisher contracts", err))?;
     Ok(Json(contracts))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePublisherRequest {
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub github_url: Option<String>,
+    pub website: Option<String>,
+}
+
+pub async fn patch_publisher_by_address(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(address): Path<String>,
+    payload: Result<Json<UpdatePublisherRequest>, JsonRejection>,
+) -> ApiResult<Json<Publisher>> {
+    if auth.publisher_address != address {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "token does not match publisher address",
+        ));
+    }
+    let Json(req) = payload.map_err(map_json_rejection)?;
+    let updated: Publisher = sqlx::query_as(
+        "UPDATE publishers
+         SET username = COALESCE($2, username),
+             email = COALESCE($3, email),
+             github_url = COALESCE($4, github_url),
+             website = COALESCE($5, website)
+         WHERE stellar_address = $1
+         RETURNING *",
+    )
+    .bind(&address)
+    .bind(&req.username)
+    .bind(&req.email)
+    .bind(&req.github_url)
+    .bind(&req.website)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| match err {
+        sqlx::Error::RowNotFound => ApiError::not_found(
+            "PublisherNotFound",
+            format!("No publisher found with address: {}", address),
+        ),
+        _ => db_internal_error("patch publisher", err),
+    })?;
+    Ok(Json(updated))
 }
 
 #[derive(Deserialize)]

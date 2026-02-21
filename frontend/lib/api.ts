@@ -71,6 +71,13 @@ export interface DependencyTreeNode {
   dependencies: DependencyTreeNode[];
 }
 
+export interface MaintenanceWindow {
+  message: string;
+  scheduled_end_at?: string;
+}
+
+export type MaturityLevel = 'alpha' | 'beta' | 'stable' | 'mature' | 'legacy';
+
 export interface ContractSearchParams {
   query?: string;
   network?: "mainnet" | "testnet" | "futurenet";
@@ -84,6 +91,7 @@ export interface ContractSearchParams {
   sort_by?: "name" | "created_at" | "popularity" | "downloads";
   sort_order?: "asc" | "desc";
   tags?: string[];
+  maturity?: 'alpha' | 'beta' | 'stable' | 'mature' | 'legacy';
   page?: number;
   page_size?: number;
 }
@@ -432,12 +440,6 @@ export const api = {
 
     const response = await fetch(`${API_URL}/api/contracts/graph${qs ? `?${qs}` : ""}`);
     if (!response.ok) throw new Error("Failed to fetch contract graph");
-    return response.json();
-  },
-
-  async getContractDependencies(id: string): Promise<any> {
-    const response = await fetch(`${API_URL}/api/contracts/${id}/dependencies`);
-    if (!response.ok) throw new Error('Failed to fetch contract dependencies');
     return response.json();
   },
 

@@ -25,6 +25,7 @@ pub async fn get_contract_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthManager;
     use crate::cache::{CacheConfig, CacheLayer};
     use crate::metrics;
     use crate::resource_tracking::{ResourceManager, ResourceUsage};
@@ -51,6 +52,7 @@ mod tests {
             cache: Arc::new(CacheLayer::new(CacheConfig::default())),
             registry,
             resource_mgr: Arc::new(RwLock::new(ResourceManager::new())),
+            auth_mgr: Arc::new(RwLock::new(AuthManager::new("test-secret".to_string()))),
         }
     }
 

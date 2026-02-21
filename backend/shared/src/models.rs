@@ -83,6 +83,15 @@ pub enum VerificationStatus {
     Failed,
 }
 
+/// Contract maturity level - indicates stability and production readiness
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MaturityLevel {
+    Experimental,
+    Beta,
+    Stable,
+    Production,
+}
+
 /// Publisher/developer information
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Publisher {
@@ -193,6 +202,7 @@ pub struct ContractSearchParams {
     pub verified_only: Option<bool>,
     pub category: Option<String>,
     pub tags: Option<Vec<String>>,
+    pub maturity: Option<MaturityLevel>,
     pub page: Option<i64>,
     #[serde(alias = "page_size")]
     pub limit: Option<i64>,
@@ -852,8 +862,8 @@ pub struct ContractAuditLog {
     pub changed_by:  String,
     pub timestamp:   DateTime<Utc>,
     pub previous_hash: Option<String>,
-    pub hash:        Option<String>,
-    pub signature:   Option<String>,
+    pub hash: Option<String>,
+    pub signature: Option<String>,
 }
 
 /// Full contract state captured at each audited change in `contract_snapshots`.
@@ -1032,83 +1042,76 @@ impl std::fmt::Display for ResidencyDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Allowed => write!(f, "allowed"),
-            Self::Denied  => write!(f, "denied"),
+            Self::Denied => write!(f, "denied"),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ResidencyPolicy {
-    pub id:              Uuid,
-    pub contract_id:     String,
+    pub id: Uuid,
+    pub contract_id: String,
     pub allowed_regions: Vec<String>,
-    pub description:     Option<String>,
-    pub is_active:       bool,
-    pub created_by:      String,
-    pub created_at:      DateTime<Utc>,
-    pub updated_at:      DateTime<Utc>,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ResidencyAuditLog {
-    pub id:               Uuid,
-    pub policy_id:        Uuid,
-    pub contract_id:      String,
+    pub id: Uuid,
+    pub policy_id: Uuid,
+    pub contract_id: String,
     pub requested_region: String,
-    pub decision:         ResidencyDecision,
-    pub action:           String,
-    pub requested_by:     Option<String>,
-    pub reason:           Option<String>,
-    pub created_at:       DateTime<Utc>,
+    pub decision: ResidencyDecision,
+    pub action: String,
+    pub requested_by: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ResidencyViolation {
-    pub id:               Uuid,
-    pub policy_id:        Uuid,
-    pub contract_id:      String,
+    pub id: Uuid,
+    pub policy_id: Uuid,
+    pub contract_id: String,
     pub attempted_region: String,
-    pub action:           String,
-    pub attempted_by:     Option<String>,
-    pub prevented_at:     DateTime<Utc>,
+    pub action: String,
+    pub attempted_by: Option<String>,
+    pub prevented_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateResidencyPolicyRequest {
-    pub contract_id:     String,
+    pub contract_id: String,
     pub allowed_regions: Vec<String>,
-    pub description:     Option<String>,
-    pub created_by:      String,
+    pub description: Option<String>,
+    pub created_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateResidencyPolicyRequest {
     pub allowed_regions: Option<Vec<String>>,
-    pub description:     Option<String>,
-    pub is_active:       Option<bool>,
+    pub description: Option<String>,
+    pub is_active: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResidencyRequest {
-    pub policy_id:        Uuid,
-    pub contract_id:      String,
+    pub policy_id: Uuid,
+    pub contract_id: String,
     pub requested_region: String,
-    pub action:           String,
-    pub requested_by:     Option<String>,
+    pub action: String,
+    pub requested_by: Option<String>,
 }
 
-impl std::fmt::Display for DeploymentEnvironment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeploymentEnvironment::Blue => write!(f, "blue"),
-            DeploymentEnvironment::Green => write!(f, "green"),
-        }
-    }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListResidencyLogsParams {
     pub contract_id: Option<String>,
-    pub limit:       Option<i64>,
-    pub page:        Option<i64>,
+    pub limit: Option<i64>,
+    pub page: Option<i64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1171,4 +1174,172 @@ pub struct EventExport {
     pub events: Vec<ContractEvent>,
     pub exported_at: DateTime<Utc>,
     pub total_count: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT PACKAGE SIGNING (Issue #67)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "signature_status", rename_all = "lowercase")]
+pub enum SignatureStatus {
+    Valid,
+    Revoked,
+    Expired,
+}
+
+impl std::fmt::Display for SignatureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Valid => write!(f, "valid"),
+            Self::Revoked => write!(f, "revoked"),
+            Self::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "transparency_entry_type", rename_all = "snake_case")]
+pub enum TransparencyEntryType {
+    PackageSigned,
+    SignatureVerified,
+    SignatureRevoked,
+    KeyRotated,
+}
+
+impl std::fmt::Display for TransparencyEntryType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageSigned => write!(f, "package_signed"),
+            Self::SignatureVerified => write!(f, "signature_verified"),
+            Self::SignatureRevoked => write!(f, "signature_revoked"),
+            Self::KeyRotated => write!(f, "key_rotated"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct PackageSignature {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub version: String,
+    pub wasm_hash: String,
+    pub signature: String,
+    pub signing_address: String,
+    pub public_key: String,
+    pub algorithm: String,
+    pub status: SignatureStatus,
+    pub signed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_reason: Option<String>,
+    pub revoked_by: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignPackageRequest {
+    pub contract_id: String,
+    pub version: String,
+    pub wasm_hash: String,
+    pub private_key: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifySignatureRequest {
+    pub contract_id: String,
+    pub version: String,
+    pub wasm_hash: String,
+    pub signature: String,
+    pub signing_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifySignatureResponse {
+    pub valid: bool,
+    pub signature_id: Option<Uuid>,
+    pub signing_address: String,
+    pub signed_at: Option<DateTime<Utc>>,
+    pub status: SignatureStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeSignatureRequest {
+    pub signature_id: String,
+    pub revoked_by: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SignatureRevocation {
+    pub id: Uuid,
+    pub signature_id: Uuid,
+    pub revoked_by: String,
+    pub reason: String,
+    pub revoked_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SigningKey {
+    pub id: Uuid,
+    pub publisher_id: Uuid,
+    pub public_key: String,
+    pub key_fingerprint: String,
+    pub algorithm: String,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub deactivated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSigningKeyRequest {
+    pub publisher_id: String,
+    pub public_key: String,
+    pub algorithm: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TransparencyLogEntry {
+    pub id: Uuid,
+    pub entry_type: TransparencyEntryType,
+    pub contract_id: Option<Uuid>,
+    pub signature_id: Option<Uuid>,
+    pub actor_address: String,
+    pub previous_hash: Option<String>,
+    pub entry_hash: String,
+    pub payload: Option<serde_json::Value>,
+    pub timestamp: DateTime<Utc>,
+    pub immutable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainOfCustodyEntry {
+    pub action: String,
+    pub actor: String,
+    pub timestamp: DateTime<Utc>,
+    pub signature_id: Option<Uuid>,
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainOfCustodyResponse {
+    pub contract_id: String,
+    pub entries: Vec<ChainOfCustodyEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransparencyLogQueryParams {
+    pub contract_id: Option<String>,
+    pub entry_type: Option<TransparencyEntryType>,
+    pub actor_address: Option<String>,
+    pub from_timestamp: Option<DateTime<Utc>>,
+    pub to_timestamp: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }

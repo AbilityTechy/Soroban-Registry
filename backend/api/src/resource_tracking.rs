@@ -164,6 +164,10 @@ impl ResourceManager {
 
         let cpu_exhaust = project_exhaustion(current_cpu, cpu_step_burn, MAX_CPU as f64, last_ts, dt);
         let mem_exhaust = project_exhaustion(current_mem, mem_step_burn, MAX_MEM as f64, last_ts, dt);
+        let cpu_exhaust =
+            project_exhaustion(current_cpu, cpu_step_burn, MAX_CPU as f64, last_ts, dt);
+        let mem_exhaust =
+            project_exhaustion(current_mem, mem_step_burn, MAX_MEM as f64, last_ts, dt);
         let cpu_exhaust_p90 =
             project_exhaustion(current_cpu, cpu_step_burn_p90, MAX_CPU as f64, last_ts, dt);
         let mem_exhaust_p90 =
@@ -173,6 +177,7 @@ impl ResourceManager {
         let variance_penalty = (cpu_sigma + mem_sigma) / (cpu_step_burn + mem_step_burn + 1.0);
         let confidence = ((1.0 - 1.0 / (n + 1.0)) * (1.0 - variance_penalty))
             .clamp(0.0, 0.99);
+        let confidence = ((1.0 - 1.0 / (n + 1.0)) * (1.0 - variance_penalty)).clamp(0.0, 0.99);
 
         UsageForecast {
             cpu_exhaustion_ts: cpu_exhaust,
